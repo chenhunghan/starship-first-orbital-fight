@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Starship — Orbital Flight Test</title>
+    <meta name="description" content="A procedural, physically based three.js simulation of a Starship orbital flight test from Starbase, Texas." />
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <canvas id="c"></canvas>
+
+    <div id="ui">
+      <header class="brand">
+        <div class="brand-title">STARSHIP</div>
+        <div class="brand-sub">ORBITAL FLIGHT TEST · STARBASE, TX</div>
+      </header>
+
+      <div id="events"></div>
+
+      <aside id="panel" class="panel">
+        <button class="panel-toggle" id="panelToggle" aria-label="Toggle controls">☰</button>
+        <div class="panel-body">
+          <section>
+            <h3>Camera</h3>
+            <div class="grid" id="cams"></div>
+            <label class="row">Lens <span id="lensVal"></span>
+              <input type="range" id="lens" min="0" max="1000" value="500" />
+            </label>
+            <div class="row small">
+              <label><input type="checkbox" id="followShip" checked /> Track ship after staging</label>
+            </div>
+          </section>
+          <section>
+            <h3>Time</h3>
+            <div class="grid time" id="speeds"></div>
+          </section>
+          <section>
+            <h3>Sun</h3>
+            <label class="row">Elevation <span id="elVal"></span><input type="range" id="sunEl" min="-4" max="60" step="0.5" value="11" /></label>
+            <label class="row">Azimuth <span id="azVal"></span><input type="range" id="sunAz" min="0" max="360" step="1" value="102" /></label>
+            <div class="grid two">
+              <button data-sun="morning">Morning</button>
+              <button data-sun="evening">Evening</button>
+            </div>
+          </section>
+          <section>
+            <h3>Rendering</h3>
+            <div class="grid four" id="quality"></div>
+            <label class="row">Exposure <span id="expVal"></span><input type="range" id="exposure" min="-2" max="2" step="0.05" value="0" /></label>
+            <div class="row small"><span id="fps">– fps</span></div>
+          </section>
+          <section class="help">
+            Drag: orbit · Right-drag: pan · Scroll: zoom<br />
+            Space: pause · R: restart · 1–8: cameras · H: hide UI
+          </section>
+        </div>
+      </aside>
+
+      <footer id="hud">
+        <div class="stage" id="hudBooster">
+          <div class="stage-name">SUPER HEAVY</div>
+          <div class="gauges">
+            <div class="gauge"><div class="g-label">SPEED</div><div class="g-val" id="bSpeed">0</div><div class="g-unit">KM/H</div></div>
+            <div class="gauge"><div class="g-label">ALTITUDE</div><div class="g-val" id="bAlt">0</div><div class="g-unit">KM</div></div>
+          </div>
+          <svg class="engines" id="bEngines" viewBox="-5 -5 10 10"></svg>
+        </div>
+        <div class="clock">
+          <div class="t" id="clock">T−00:00:20</div>
+          <div class="timeline" id="timeline"><div class="progress" id="progress"></div></div>
+          <div class="controls">
+            <button id="restart" title="Restart (R)">⟲</button>
+            <button id="play" title="Pause (Space)">❚❚</button>
+            <button id="sound" title="Sound">🔇</button>
+          </div>
+        </div>
+        <div class="stage" id="hudShip">
+          <div class="stage-name">STARSHIP</div>
+          <div class="gauges">
+            <div class="gauge"><div class="g-label">SPEED</div><div class="g-val" id="sSpeed">0</div><div class="g-unit">KM/H</div></div>
+            <div class="gauge"><div class="g-label">ALTITUDE</div><div class="g-val" id="sAlt">0</div><div class="g-unit">KM</div></div>
+          </div>
+          <svg class="engines" id="sEngines" viewBox="-5 -5 10 10"></svg>
+        </div>
+      </footer>
+    </div>
+
+    <div id="intro">
+      <div class="intro-card">
+        <div class="intro-title">STARSHIP</div>
+        <div class="intro-sub">Orbital Flight Test · Starbase, Texas</div>
+        <p>
+          A procedural recreation of a Starship launch: 33 Raptors, a water-deluged launch mount,
+          hot staging and a booster return. Built with three.js from code only — no textures, models or recorded audio.
+        </p>
+        <div class="intro-buttons">
+          <button id="goSound" class="primary">Launch with sound</button>
+          <button id="goMute">Launch muted</button>
+        </div>
+        <div class="intro-note" id="loading">Building terrain, clouds and vehicle…</div>
+      </div>
+    </div>
+
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>
