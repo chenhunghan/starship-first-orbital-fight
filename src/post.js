@@ -1,8 +1,10 @@
 import * as THREE from 'three';
 
 // HDR render pipeline:
-//  main (MSAA, float depth) -> particles (reduced res, premultiplied) ->
+//  main (MSAA) -> particles (reduced res, premultiplied) ->
 //  composite -> bloom mip chain -> ACES tonemap, grain, vignette -> screen
+//  The reduced-res passes read scene depth from a separate single-sample depth prepass
+//  target (resolving the MSAA float depth is slow on tile-based GPUs).
 
 const FS_VERT = 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }';
 
@@ -120,11 +122,12 @@ export class Pipeline {
 
   makeRT(w, h, opts = {}) {
     const rt = new THREE.WebGLRenderTarget(Math.max(1, Math.floor(w)), Math.max(1, Math.floor(h)), {
-      type: THREE.HalfFloatType,
+      type: opts.type ?? THREE.HalfFloatType,
       minFilter: THREE.LinearFilter,
       magFilter: THREE.LinearFilter,
       depthBuffer: opts.depth ?? false,
       samples: opts.samples ?? 0,
+      resolveDepthBuffer: opts.resolveDepth ?? true,
     });
     if (opts.depthTexture) {
       rt.depthTexture = new THREE.DepthTexture(rt.width, rt.height, THREE.FloatType);
@@ -138,9 +141,10 @@ export class Pipeline {
     this.targets = [];
     const p = this.params;
     this.w = w; this.h = h;
-    this.main = this.makeRT(w, h, { depth: true, samples: p.msaa, depthTexture: true });
+    this.main = this.makeRT(w, h, { depth: true, samples: p.msaa, resolveDepth: false });
     this.refl = this.makeRT(w * p.reflScale, h * p.reflScale, { depth: true });
     this.part = this.makeRT(w * p.partScale, h * p.partScale);
+    this.depth = this.makeRT(w, h, { depth: true, depthTexture: true, type: THREE.UnsignedByteType }); // colour unused
     this.comp = this.makeRT(w, h);
     this.bloomDown = [];
     this.bloomUp = [];

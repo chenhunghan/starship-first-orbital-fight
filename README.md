@@ -1,10 +1,31 @@
 # Starship — Orbital Flight Test (three.js)
 
-A procedural, physically based, real-time recreation of a SpaceX **Starship / Super Heavy** orbital flight test from Starbase, Texas. It covers the countdown, the staggered 33-Raptor ignition on a water-deluged launch mount, liftoff, max-Q, hot staging, the booster's flip, boostback and landing burn over the Gulf, and the ship's climb to SECO.
+A procedural, physically based, real-time recreation of a SpaceX **Starship / Super Heavy** flight test, modelled on **Flight 14** (28 Sep 2026, the first orbital flight, Block 3 vehicles). It runs from the countdown at Starbase to a dawn splashdown in the North Pacific:
+
+- Water-deluged liftoff with a staggered start of 33 Raptor 3 engines.
+- Max-Q, hot staging, then the booster's boostback and landing burn to a soft splashdown in the Gulf.
+- SECO onto a suborbital path, then an orbit-insertion burn into a ~260 × 280 km orbit.
+- The Starlink V3 deployment window, then the deorbit burn.
+- Plasma re-entry and the belly-flop.
+- The flip and landing burn, then a tail-first splashdown, tip-over and fireball.
 
 **Live:** https://chenhunghan.github.io/starship-first-orbital-fight/
 
 Everything is generated from code. The project has **no external assets**: no textures, models, HDRIs or audio files. The only runtime dependency is [three.js](https://threejs.org).
+
+### Mission timeline (simulated vs. Flight 14)
+
+| Event | Simulation | Flight 14 (reported) |
+| --- | --- | --- |
+| Liftoff | T+0:00 | 07:48:59 CDT |
+| MECO / hot staging | T+2:22 | T+2:20 – 2:31 |
+| Booster soft splashdown (Gulf) | T+7:09 | ≈ T+7 |
+| SECO | T+7:16 | T+8:11 |
+| Orbit insertion burn (1 Raptor) | T+26:16 → 260 × 282 km | T+25:17 → 262 × 277 km |
+| Deorbit burn | T+2:12:18 | T+2:12:18 |
+| Splashdown (dawn) | T+3:07 | T+3:08:30 |
+
+Almost all of these times come out of the physics and guidance rather than being scripted. The exceptions are the deorbit time and the start of the Starlink deploy window, which follow the published schedule.
 
 ## What's simulated
 
@@ -14,10 +35,11 @@ Everything is generated from code. The project has **no external assets**: no te
 - Raptor thrust depends on ambient pressure (`F = F_vac − p_a·A_e`), and mass flow is `F_vac / (Isp·g₀)`. Engines spool up and down, and the ignition is staggered (centre → inner ring → outer ring).
 - Guidance:
   - The booster rises vertically to clear the tower, then pitches over and flies a gravity turn. It throttles down for max-Q and limits acceleration late in the burn.
-  - MECO happens once the landing propellant reserve is reached, followed by hot staging, a flip and a boostback burn.
-  - The booster computes a suicide-burn ignition point, flies the 13 → 3 engine landing burn and splashes down about 5 km offshore.
-  - The ship uses closed-loop ascent guidance up to SECO.
-- The simulated timeline (≈ max-Q at T+55 s, MECO at T+2:40 at ~65 km and ~5,900 km/h, SECO at ~150 km and ~26,000 km/h) is close to the real flight tests.
+  - MECO happens once the landing propellant reserve is reached. Then come hot staging, a flip, a boostback burn with 31 engines and a suicide-burn landing (11 → 5 → 3 engines) to a soft splashdown offshore.
+  - The ship's closed-loop ascent guidance targets SECO on a "passively safe" suborbital trajectory. At apogee it relights one engine to insert into orbit, and later performs a retrograde deorbit burn.
+- Re-entry uses a Newtonian lifting-body model of the belly-first ship, with its angle of attack decreasing through the hypersonic phase. It is followed by the subsonic belly-flop, then the flip and a 3-engine landing burn.
+- Stagnation heating (~√ρ·v³) drives the plasma sheath, the ionised wake and the glow of the heat-shield tiles.
+- The scene origin hops along the ground track, so the ship can be followed around the planet with float precision intact. The local sun direction follows Earth's rotation and the vehicle's position, so the splashdown happens at dawn.
 
 ### Rendering
 - **Sky:** a single-scattering Rayleigh + Mie + ozone atmosphere with an approximation of multiple scattering. It works from sea level to space, where you see a black sky and the atmospheric limb. Cirrus and contrails are drawn in the sky pass.
@@ -39,6 +61,7 @@ Everything is generated from code. The project has **no external assets**: no te
   - Hexagonal heat-shield tiles on the windward side, flaps, grid fins, chines and the vented hot-staging ring.
   - Engine bells that glow while firing.
 - **Post-processing:** HDR, bloom, ACES tone mapping, camera-style white balance, grain and vignette.
+- **Performance:** an adaptive quality governor targets 30 fps by scaling render resolution (and ray-march steps at the lowest levels), never exceeding the chosen preset. The smoke volume is splatted in a single instanced draw into slice atlases, the cloud weather field and sun transmittance are baked, and a depth prepass feeds the volumetric passes.
 - **Audio:** procedural rumble, roar and crackle. Sound arrives with the real propagation delay (343 m/s) and loses high frequencies over distance.
 
 ## Controls
@@ -46,15 +69,15 @@ Everything is generated from code. The project has **no external assets**: no te
 | Input | Action |
 | --- | --- |
 | Drag / right-drag / scroll | Orbit / pan / zoom |
-| `1`–`8` | Cameras: drone, long lens, lagoon, chase plane, pad cam, onboard, tracker, free orbit |
+| `1`–`8` | Cameras: drone, long lens, lagoon, chase plane, pad cam, onboard (booster engine cam / ship flap cam), tracker, free orbit |
 | Lens slider | Focal length, 12–2400 mm |
 | `Space` / `R` | Pause / restart |
-| Timeline dots | Jump to a flight event |
+| Timeline dots | Jump to a flight event (auto time-warp skips the quiet coast and orbit phases) |
 | `H` | Hide the UI |
 
 You can also set the sun position (morning or evening launch), exposure and render quality from the control panel.
 
-URL parameters: `?q=low|medium|high|ultra`, `?cam=telephoto`, `?t=120` (seek to that time), `?autostart`.
+URL parameters: `?q=low|medium|high|ultra`, `?cam=telephoto`, `?t=120` (seek to that time), `?autostart`, `?pause` (pause after seeking), `?nogov` (disable the adaptive resolution governor), `?prof` / `?prof=sync` / `?prof=cpu` (per-pass timings via `window.__prof.report()`).
 
 ## Development
 

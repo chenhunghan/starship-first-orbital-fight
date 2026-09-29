@@ -83,10 +83,7 @@ export class ParticleSystem {
     const wx0 = this.wind.x, wz0 = this.wind.z;
     for (let i = 0; i < this.count; i++) {
       const k = this.kind[i];
-      if (k === KIND.CLOUD) {
-        p[i * 3] += wx0 * 0.6 * dt; p[i * 3 + 2] += wz0 * 0.6 * dt;
-        continue;
-      }
+      if (k === KIND.CLOUD) continue; // drifted once per frame (driftClouds)
       const age = (this.age[i] += dt);
       const life = this.life[i];
       if (age >= life) { this.kill(i); i--; continue; }
@@ -152,6 +149,13 @@ export class ParticleSystem {
       this.rot[i] += this.rotV[i] * dt;
       // emissive temperature (for fire) stored in warm-independent channel
     }
+  }
+
+  /** Cloud puffs only drift with the wind: one pass per frame instead of per sub-step. */
+  driftClouds(dt) {
+    if (dt <= 0) return;
+    const p = this.p, dx = this.wind.x * 0.6 * dt, dz = this.wind.z * 0.6 * dt;
+    for (let i = 0; i < this.count; i++) if (this.kind[i] === KIND.CLOUD) { p[i * 3] += dx; p[i * 3 + 2] += dz; }
   }
 
   // --------------------------------------------------------- lighting grid

@@ -120,8 +120,50 @@ export function computeLighting(sunDir, altitude = 30) {
   return { sun, sunT: T, sky, ground, horizon, aerialSun: T200, ring };
 }
 
+// Bake the sun optical depth over (altitude, sun cosine) so the atmosphere march needs one
+// fetch per sample instead of an 8-step integration (re-baked if the haze height changes).
+function transmittanceLUT(renderer, uniforms) {
+  const W = 128, H = 512;
+  const rt = new THREE.WebGLRenderTarget(W, H, { type: THREE.FloatType, depthBuffer: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+  rt.texture.generateMipmaps = false;
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uMieBeta: uniforms.uMieBeta, uMieH: uniforms.uMieH },
+    defines: { TRANS_LUT_BAKE: 1 },
+    vertexShader: 'void main(){ gl_Position = vec4(position.xy, 0.0, 1.0); }',
+    fragmentShader: /* glsl */ `
+      ${ATMOS}
+      void main() {
+        vec2 c = (gl_FragCoord.xy - 0.5) / (TRANS_LUT - 1.0);
+        float h = c.x * c.x * (ATMOS_R - PLANET_R);
+        float mu = sign(c.y - 0.5) * (2.0 * c.y - 1.0) * (2.0 * c.y - 1.0);
+        float r = PLANET_R + h;
+        // below the horizon the sun is blocked (handled analytically): keep the grazing value
+        float rb = (PLANET_R - 200.0) / r;
+        mu = max(mu, -sqrt(max(0.0, 1.0 - rb * rb)) + 1e-4);
+        gl_FragColor = vec4(sunOpticalDepth(vec3(0.0, r, 0.0), vec3(sqrt(max(0.0, 1.0 - mu * mu)), mu, 0.0)), 1.0);
+      }`,
+  });
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat);
+  quad.frustumCulled = false;
+  const scene = new THREE.Scene();
+  scene.add(quad);
+  const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  let bakedH = null;
+  return {
+    texture: rt.texture,
+    update() {
+      if (bakedH === uniforms.uMieH.value) return;
+      bakedH = uniforms.uMieH.value;
+      const prev = renderer.getRenderTarget();
+      renderer.setRenderTarget(rt);
+      renderer.render(scene, cam);
+      renderer.setRenderTarget(prev);
+    },
+  };
+}
+
 // ---------------------------------------------------------------- sky mesh
-export function createSky() {
+export function createSky(renderer) {
   const uniforms = {
     uSunDir: { value: new THREE.Vector3(0, 1, 0) },
     uMieBeta: { value: atmosParams.mieBeta },
@@ -133,19 +175,23 @@ export function createSky() {
     uSunDisc: { value: 1.0 },
     uSteps: { value: 16 },
     uPlanetOffset: { value: new THREE.Vector3() },
+    uTransLUT: { value: null },
   };
+  const lut = transmittanceLUT(renderer, uniforms);
+  uniforms.uTransLUT.value = lut.texture;
   const material = new THREE.ShaderMaterial({
     uniforms,
     side: THREE.BackSide,
     depthWrite: false,
+    // drawn after the opaque scene at the far plane (no frag-depth write), so the
+    // early depth test skips the expensive atmosphere wherever geometry covers the sky
+    depthFunc: THREE.LessEqualDepth,
     vertexShader: /* glsl */ `
       varying vec3 vDir;
-      #include <common>
-      #include <logdepthbuf_pars_vertex>
       void main() {
         vDir = normalize((modelMatrix * vec4(position, 0.0)).xyz);
         gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        #include <logdepthbuf_vertex>
+        gl_Position.z = gl_Position.w;
       }`,
     fragmentShader: /* glsl */ `
       uniform vec3 uSunDir;
@@ -154,8 +200,6 @@ export function createSky() {
       uniform vec3 uPlanetOffset;
       uniform int uSteps;
       varying vec3 vDir;
-      #include <common>
-      #include <logdepthbuf_pars_fragment>
       ${NOISE}
       ${ATMOS}
 
@@ -232,13 +276,12 @@ export function createSky() {
         float st = step(0.9975, hash13(floor(sp))) * hash13(floor(sp) + 3.0);
         col += vec3(st) * 0.012 * smoothstep(0.02, 0.0, lum);
         gl_FragColor = vec4(min(col, vec3(20000.0)), 1.0);
-        #include <logdepthbuf_fragment>
       }`,
   });
   const mesh = new THREE.Mesh(new THREE.SphereGeometry(1, 64, 32), material);
   mesh.scale.setScalar(9e5);
   mesh.frustumCulled = false;
-  mesh.renderOrder = -1000;
+  mesh.renderOrder = 1000; // last opaque
   mesh.name = 'sky';
-  return { mesh, uniforms };
+  return { mesh, uniforms, updateLUT: lut.update };
 }

@@ -11,6 +11,7 @@ import { SOFT_DEPTH } from './particles.js';
 // into a huge faint plume.
 
 const P0 = 101325;
+const _m = new THREE.Matrix4(), _inv = new THREE.Matrix4(), _fwd = new THREE.Vector3();
 const EXHAUST = /* glsl */ `
 // ---- exhaust colour model -------------------------------------------------
 // Normalised blackbody colour (linear sRGB), fit of the Planckian locus.
@@ -199,17 +200,19 @@ function volumeMaterial(reflection, plasma = false) {
           // gradual dissipation: no hard end, it thins out into the air
           float fall = exp(-s / (uL * 0.32)) * (1.0 - smoothstep(0.7 * uLb * 0.5, uLb * 0.98, s));
           float spread = (uR0 * uR0) / (Rs * Rs);
+          float rn = rr / Rs;
+          // afterburning of fuel-rich exhaust with entrained air in the shear layer (dense air only)
+          float shear = exp(-pow((rn - 0.85) / 0.35, 2.0)) * uPr * smoothstep(3.0, 18.0, s) * exp(-s / (uL * 0.6));
+          // empty part of the bounding cylinder: skip the noise (the other factors are < ~8)
+          if ((core + shear * 0.6) * fall * spread * dt < 1e-6) continue;
           // merged shock structure near sea level
           float dia = 1.0 + 2.2 * uPr * exp(-pow((s - 26.0) / 5.5, 2.0)) * exp(-rr * rr / (Rs * Rs * 0.12));
           float nz = fbm3(vec3(q.x * 0.12, s * 0.07 - uTime * 7.0, q.z * 0.12), 3);
           float nz2 = fbm3(vec3(q.x * 0.05, s * 0.03 - uTime * 3.0, q.z * 0.05), 3);
           float turb = mix(0.75 + 0.5 * nz, max(0.0, 2.2 * nz2 - 0.55) * (0.6 + nz), smoothstep(0.1, 1.1, sn));
           // temperature: hot potential core cooling downstream and toward the mixing layer
-          float rn = rr / Rs;
           float Tax = 1100.0 + 2300.0 * exp(-s / (uL * 0.22)) + 500.0 * (dia - 1.0);
           float T = mix(900.0, Tax, exp(-rn * rn * 1.4));
-          // afterburning of fuel-rich exhaust with entrained air in the shear layer (dense air only)
-          float shear = exp(-pow((rn - 0.85) / 0.35, 2.0)) * uPr * smoothstep(3.0, 18.0, s) * exp(-s / (uL * 0.6));
           #ifdef PLASMA
             // re-entry wake: hot pink/orange near the ship, violet as it streams away
             vec3 c = mix(mix(vec3(1.0, 0.5, 0.25), vec3(1.0, 0.32, 0.62), smoothstep(0.0, 0.25, sn)), vec3(0.55, 0.3, 1.0), smoothstep(0.3, 1.2, sn)) * 0.9;
@@ -295,11 +298,11 @@ export class Plume {
     if (this.plasma) { L = this.fixedL ?? 320; tanT = this.fixedTan ?? 0.1; }
     const Lb = L * 2;
     const Rb = (this.clusterR + Lb * tanT * 2.4) * 1.1 + 3;
-    this.group.matrix.copy(stageMatrix).multiply(new THREE.Matrix4().makeTranslation(0, this.exitY, 0));
+    this.group.matrix.copy(stageMatrix).multiply(_m.makeTranslation(0, this.exitY, 0));
     this.group.matrixWorld.copy(this.group.matrix);
     this.group.updateMatrixWorld(true);
-    const inv = this.group.matrixWorld.clone().invert();
-    const fwd = new THREE.Vector3();
+    const inv = _inv.copy(this.group.matrixWorld).invert();
+    const fwd = _fwd;
     camera.getWorldDirection(fwd);
     for (const m of [this.volMain, this.volRefl]) {
       const u = m.uniforms;

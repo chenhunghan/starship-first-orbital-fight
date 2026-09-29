@@ -62,18 +62,34 @@ vec3 densities(float h) {
 }
 vec3 extinction(vec3 od) { return BETA_R * od.x + uMieBeta * 1.11 * od.y + BETA_OZ * od.z; }
 
-vec3 sunTransmittance(vec3 p, vec3 sunDir) {
+// optical depth toward the sun (8-step midpoint rule); baked into uTransLUT by sky.js
+vec3 sunOpticalDepth(vec3 p, vec3 sunDir) {
   vec2 ta = raySphere(p, sunDir, ATMOS_R);
-  vec2 tp = raySphere(p, sunDir, PLANET_R - 200.0);
-  if (tp.x > 0.0) return vec3(0.0);
   float seg = ta.y / 8.0;
   vec3 od = vec3(0.0);
   for (int j = 0; j < 8; j++) {
     vec3 q = p + sunDir * seg * (float(j) + 0.5);
     od += densities(length(q) - PLANET_R) * seg;
   }
-  return exp(-extinction(od));
+  return od;
 }
+// LUT parameterisation: sqrt(altitude / 100 km), sun cosine with sqrt spacing (dense near the horizon)
+#define TRANS_LUT vec2(128.0, 512.0)
+vec2 transLutCoord(float h, float mu) {
+  return vec2(sqrt(clamp(h / (ATMOS_R - PLANET_R), 0.0, 1.0)), 0.5 + 0.5 * sign(mu) * sqrt(abs(mu)));
+}
+#ifdef TRANS_LUT_BAKE
+  vec3 sunTransmittance(vec3 p, vec3 sunDir) { return exp(-extinction(sunOpticalDepth(p, sunDir))); }
+#else
+  uniform sampler2D uTransLUT;
+  vec3 sunTransmittance(vec3 p, vec3 sunDir) {
+    vec2 tp = raySphere(p, sunDir, PLANET_R - 200.0);
+    if (tp.x > 0.0) return vec3(0.0);
+    float r = length(p);
+    vec2 c = transLutCoord(r - PLANET_R, dot(p, sunDir) / r);
+    return exp(-extinction(textureLod(uTransLUT, (c * (TRANS_LUT - 1.0) + 0.5) / TRANS_LUT, 0.0).xyz));
+  }
+#endif
 
 // Returns inscattered radiance along ray, and transmittance in .w of out param
 vec3 atmosphere(vec3 ro, vec3 rd, vec3 sunDir, float tMaxIn, out vec3 transmit, int steps) {
@@ -176,18 +192,31 @@ vec3 applyAerial(vec3 col, vec3 wp, vec3 camPos) {
 export const CLOUD_WEATHER = /* glsl */ `
 #define CB 1050.0
 #define CT 4200.0
+#define WEATHER_Q 9.0
 uniform float uCoverage, uCloudTime;
+uniform sampler2D uWeather;
 vec2 windOff() { return vec2(-3.2, -2.4) * uCloudTime * 0.6; }
 float remap(float v, float a, float b, float c, float d) { return c + (v - a) / (b - a) * (d - c); }
+// smooth part of the weather field (baked into uWeather over |q| < WEATHER_Q):
+// x = cumulus octaves 0-2 + clusters, y = cloud-top field
+vec2 weatherBase(vec2 q) {
+  float big = fbm2(q * 0.35 + 1.3, 3);                 // cloud streets / clusters (~30 km)
+  return vec2(fbm2(q * 2.2, 3) * 0.75 + big * 0.45, fbm2(q * 1.3 + 3.0, 3));
+}
 // coverage & cloud-top height from a 2D weather field
 vec2 weather(vec2 p) {
   vec2 q = (p - windOff()) * 0.00011;
-  float big = fbm2(q * 0.35 + 1.3, 3);                 // cloud streets / clusters (~30 km)
-  float c = fbm2(q * 2.2, 4) * 0.75 + big * 0.45;       // individual cumulus (~2-4 km)
+  vec2 uv = q * (0.5 / WEATHER_Q) + 0.5;
+  vec2 b = abs(uv.x - 0.5) < 0.499 && abs(uv.y - 0.5) < 0.499 ? textureLod(uWeather, uv, 0.0).xy : weatherBase(q);
+  // individual cumulus (~2-4 km): the finest octave of fbm2(q * 2.2, 4) stays analytic
+  vec2 p3 = q * 2.2;
+  mat2 r = mat2(0.8, -0.6, 0.6, 0.8);
+  for (int i = 0; i < 3; i++) p3 = r * p3 * 2.03 + 17.1;
+  float c = b.x + 0.75 * 0.0625 * vnoise2(p3);
   float cov = clamp((c - (1.18 - uCoverage)) * 4.5, 0.0, 1.0);
   // keep the sky directly above the pad clear-ish
   cov *= smoothstep(1800.0, 5200.0, length(p));
-  float top = mix(0.18, 1.0, smoothstep(0.45, 0.85, fbm2(q * 1.3 + 3.0, 3))) * (0.5 + 0.5 * cov);
+  float top = mix(0.18, 1.0, smoothstep(0.45, 0.85, b.y)) * (0.5 + 0.5 * cov);
   return vec2(cov, top);
 }
 

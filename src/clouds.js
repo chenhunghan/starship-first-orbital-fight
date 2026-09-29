@@ -63,6 +63,35 @@ function buildNoise3D(N = 64) {
   return tex;
 }
 
+// Bake the smooth octaves of the cloud weather field once (the march and every lit
+// material's cloud shadow then need one texture fetch + one noise octave per lookup).
+export function bakeWeather(renderer, size = 2048) {
+  const rt = new THREE.WebGLRenderTarget(size, size, { type: THREE.HalfFloatType, format: THREE.RGFormat, depthBuffer: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+  rt.texture.generateMipmaps = false;
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uSize: { value: size } },
+    vertexShader: 'void main(){ gl_Position = vec4(position.xy, 0.0, 1.0); }',
+    fragmentShader: /* glsl */ `
+      uniform float uSize;
+      uniform vec3 uSunDir;
+      ${NOISE}
+      ${CLOUD_WEATHER}
+      void main() { gl_FragColor = vec4(weatherBase((gl_FragCoord.xy / uSize - 0.5) * 2.0 * WEATHER_Q), 0.0, 1.0); }`,
+  });
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat);
+  quad.frustumCulled = false;
+  const scene = new THREE.Scene();
+  scene.add(quad);
+  const prev = renderer.getRenderTarget();
+  renderer.setRenderTarget(rt);
+  renderer.render(scene, new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1));
+  renderer.setRenderTarget(prev);
+  mat.dispose();
+  quad.geometry.dispose();
+  shared.uWeather.value = rt.texture;
+  return rt.texture;
+}
+
 export function createClouds() {
   const noise = buildNoise3D(64);
   const uniforms = {

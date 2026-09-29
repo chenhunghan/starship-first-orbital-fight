@@ -18,6 +18,12 @@ struct Surf { float water; float ocean; float foam; vec3 albedo; float rough; fl
 
 Surf surface(vec2 p, float dist) {
   Surf s;
+  if (uOpen > 0.5) {
+    // open ocean far from any coast (splashdown zone): the water shading replaces everything
+    s.water = 1.0; s.ocean = 1.0; s.foam = 0.0; s.wet = 0.0; s.padSoot = 0.0; s.rough = 0.95;
+    s.albedo = vec3(0.01, 0.03, 0.045);
+    return s;
+  }
   float sx = shoreX(p.y);
   float dx = p.x - sx;
   float lod = clamp(dist / 2500.0, 0.0, 1.0);
@@ -128,11 +134,6 @@ Surf surface(vec2 p, float dist) {
   s.albedo = col;
   s.rough = rough;
   s.wet = wet;
-  if (uOpen > 0.5) {
-    // open ocean far from any coast (splashdown zone)
-    s.water = 1.0; s.ocean = 1.0; s.foam = 0.0; s.wet = 0.0; s.padSoot = 0.0;
-    s.albedo = vec3(0.01, 0.03, 0.045);
-  }
   return s;
 }
 `;
@@ -196,18 +197,25 @@ export function createTerrain() {
           float e = 0.6;
           vec2 q = vFlat;
           float amp = mix(0.0, 1.0, 1.0 - clamp(camDist / 1500.0, 0.0, 1.0));
-          float h0 = fbm2(q * 0.35, 3), hx = fbm2((q + vec2(e, 0.0)) * 0.35, 3), hz = fbm2((q + vec2(0.0, e)) * 0.35, 3);
-          vec3 nl = normalize(vec3(-(hx - h0) * 0.9 * amp, 1.0, -(hz - h0) * 0.9 * amp));
+          // (each normal is only evaluated where it contributes: same result, less noise)
+          vec3 nl = vec3(0.0, 1.0, 0.0);
+          if (amp > 0.0 && S.water < 1.0) {
+            float h0 = fbm2(q * 0.35, 3), hx = fbm2((q + vec2(e, 0.0)) * 0.35, 3), hz = fbm2((q + vec2(0.0, e)) * 0.35, 3);
+            nl = normalize(vec3(-(hx - h0) * 0.9 * amp, 1.0, -(hz - h0) * 0.9 * amp));
+          }
           // water normal
-          float t = uTime;
-          vec2 w1 = q * vec2(0.045, 0.02) + vec2(t * 0.09, t * 0.02);
-          vec2 w2 = q * vec2(0.13, 0.19) - vec2(t * 0.05, t * 0.12);
-          float oceanAmp = mix(0.06, 0.32, S.ocean);
-          float fade = 1.0 / (1.0 + camDist / 1200.0);
-          float a0 = vnoise2(w1) + 0.5 * vnoise2(w2);
-          float ax = vnoise2(w1 + vec2(0.045, 0.0) * 1.5) + 0.5 * vnoise2(w2 + vec2(0.13, 0.0) * 1.5);
-          float az = vnoise2(w1 + vec2(0.0, 0.02) * 1.5) + 0.5 * vnoise2(w2 + vec2(0.0, 0.19) * 1.5);
-          vec3 nw = normalize(vec3(-(ax - a0) * oceanAmp * 6.0 * fade, 1.0, -(az - a0) * oceanAmp * 6.0 * fade));
+          vec3 nw = vec3(0.0, 1.0, 0.0);
+          if (S.water > 0.0) {
+            float t = uTime;
+            vec2 w1 = q * vec2(0.045, 0.02) + vec2(t * 0.09, t * 0.02);
+            vec2 w2 = q * vec2(0.13, 0.19) - vec2(t * 0.05, t * 0.12);
+            float oceanAmp = mix(0.06, 0.32, S.ocean);
+            float fade = 1.0 / (1.0 + camDist / 1200.0);
+            float a0 = vnoise2(w1) + 0.5 * vnoise2(w2);
+            float ax = vnoise2(w1 + vec2(0.045, 0.0) * 1.5) + 0.5 * vnoise2(w2 + vec2(0.13, 0.0) * 1.5);
+            float az = vnoise2(w1 + vec2(0.0, 0.02) * 1.5) + 0.5 * vnoise2(w2 + vec2(0.0, 0.19) * 1.5);
+            nw = normalize(vec3(-(ax - a0) * oceanAmp * 6.0 * fade, 1.0, -(az - a0) * oceanAmp * 6.0 * fade));
+          }
           wN = normalize(mix(nl, nw, S.water));
           normal = normalize((viewMatrix * vec4(wN, 0.0)).xyz);
         }

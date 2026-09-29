@@ -148,7 +148,7 @@ export class FlightSim {
   reset() {
     this.t = -20;                 // mission elapsed time (T-20 s)
     this.booster = new Stage('Super Heavy', 230000, 4000000, 71, boosterEngines());
-    this.ship = new Stage('Starship', 170000, 1600000, 52, shipEngines()); // dry + 26 Starlink V3
+    this.ship = new Stage('Starship', 200000, 1600000, 52, shipEngines()); // dry + 26 Starlink V3
     this.stacked = true;
     this.released = false;
     this.events = [];

@@ -64,7 +64,8 @@ export class Effects {
     }
 
     // ------------------------------------------------ deluge water spray
-    const spray = sim.deluge * Math.max(0, 1 - thrust * 3);
+    // deluge only matters at the pad (and before the vehicle leaves it)
+    const spray = s.atPad === false || t > 60 ? 0 : sim.deluge * Math.max(0, 1 - thrust * 3);
     n = this.rate('spray', 260 * spray * (s.quality ?? 1), dt);
     for (let i = 0; i < n; i++) {
       const ang = r() * Math.PI * 2, rad = Math.sqrt(r()) * 13;
@@ -73,7 +74,7 @@ export class Effects {
       });
     }
     // mist rising from the plate once water is flowing under the engines
-    n = this.rate('mist', 18 * sim.deluge * (thrust < 0.05 ? 1 : 0), dt);
+    n = this.rate('mist', s.atPad === false || t > 60 ? 0 : 18 * sim.deluge * (thrust < 0.05 ? 1 : 0), dt);
     for (let i = 0; i < n; i++) {
       const ang = r() * Math.PI * 2, rad = Math.sqrt(r()) * 16;
       ps.emit(Math.cos(ang) * rad, 3, Math.sin(ang) * rad, 0, 1 + r() * 2, 0, { life: 10 + r() * 6, r0: 3, r1: 11, growT: 4, dens: 0.35, kind: KIND.VAPOR });

@@ -2,13 +2,15 @@ import * as THREE from 'three';
 import { NOISE, AERIAL } from './glsl.js';
 import { shared } from './shared.js';
 import { KIND } from './particles.js';
+import { prof } from './prof.js';
 
 // Particle-driven volumetric exhaust / steam.
 //
 // 1. splat : the CPU-simulated smoke particles are rasterised into a 3D volume
-//            (R = steam density, G = incandescent heat, B = dust) one Y-slice at a time.
+//            (R = steam density, G = incandescent heat, B = dust). The volume is a 2D
+//            atlas of Y-slices, so all slices are splatted in one instanced draw.
 // 2. light : for every (half-res) voxel, optical depth toward the sun and toward
-//            the engine fire, plus a local occlusion term.
+//            the engine fire, plus a local occlusion term (one draw into a second atlas).
 // 3. march : full-screen ray march through the volume with Perlin-Worley erosion
 //            for the cauliflower detail, Beer + multiple-scattering octaves,
 //            fire emission and scene-depth occlusion. The result is split into the
@@ -22,26 +24,55 @@ export function insideVolume(x, y, z, margin = 0) {
   return x > VOL.ox + margin && x < VOL.ox + VOL.sx - margin && y < VOL.oy + VOL.sy - margin && z > VOL.oz + margin && z < VOL.oz + VOL.sz - margin;
 }
 
+const _c = new THREE.Color();
 const FS_VERT = 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }';
+const SPLAT_K = 20; // max slices one puff can span (radius < (K - 1) * cell / 2)
+
+// trilinear fetch from a slice atlas: n = voxels (x, y, z), tiles = slices per atlas row/column
+const VOL_TEX = /* glsl */ `
+vec4 volTex(sampler2D tex, vec3 u, vec3 n, vec2 tiles) {
+  float fy = clamp(u.y * n.y - 0.5, 0.0, n.y - 1.0);
+  float j0 = floor(fy), j1 = min(j0 + 1.0, n.y - 1.0);
+  vec2 h = 0.5 / n.xz;
+  vec2 xz = clamp(u.xz, h, 1.0 - h);
+  vec4 a = texture(tex, (vec2(mod(j0, tiles.x), floor(j0 / tiles.x)) + xz) / tiles);
+  vec4 b = texture(tex, (vec2(mod(j1, tiles.x), floor(j1 / tiles.x)) + xz) / tiles);
+  return mix(a, b, fy - j0);
+}
+`;
+function atlasRT(nx, ny, nz, tx) {
+  const rt = new THREE.WebGLRenderTarget(nx * tx, nz * (ny / tx), { type: THREE.HalfFloatType, depthBuffer: false });
+  rt.texture.minFilter = rt.texture.magFilter = THREE.LinearFilter;
+  rt.texture.generateMipmaps = false;
+  rt.tiles = new THREE.Vector2(tx, ny / tx);
+  rt.grid = new THREE.Vector3(nx, ny, nz);
+  return rt;
+}
 
 export class SmokeVolume {
   constructor(renderer, noiseTex, max = 20000) {
     this.renderer = renderer;
     this.max = max;
     const { nx, ny, nz } = VOL;
-    this.dens = new THREE.WebGL3DRenderTarget(nx, nz, ny, { type: THREE.HalfFloatType, depthBuffer: false });
-    this.dens.texture.minFilter = this.dens.texture.magFilter = THREE.LinearFilter;
-    this.dens.texture.wrapS = this.dens.texture.wrapT = this.dens.texture.wrapR = THREE.ClampToEdgeWrapping;
+    this.dens = atlasRT(nx, ny, nz, 8);           // 8 x 8 slices of 128 x 128
     this.lnx = nx / 2; this.lny = ny / 2; this.lnz = nz / 2;
-    this.light = new THREE.WebGL3DRenderTarget(this.lnx, this.lnz, this.lny, { type: THREE.HalfFloatType, depthBuffer: false });
-    this.light.texture.minFilter = this.light.texture.magFilter = THREE.LinearFilter;
-    this.light.texture.wrapS = this.light.texture.wrapT = this.light.texture.wrapR = THREE.ClampToEdgeWrapping;
+    this.light = atlasRT(this.lnx, this.lny, this.lnz, 8); // 8 x 4 slices of 64 x 64
     this.cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    this.dirty = true;
 
     // --------------------------------------------------------------- splat
+    // one instance per puff, SPLAT_K quads per instance: quad k lands in the k-th slice the
+    // sphere overlaps (unused quads are culled in the vertex shader)
     const quad = new THREE.InstancedBufferGeometry();
-    quad.setAttribute('position', new THREE.Float32BufferAttribute([-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0], 3));
-    quad.setIndex([0, 1, 2, 0, 2, 3]);
+    const pos = [], ks = [], idx = [];
+    for (let k = 0; k < SPLAT_K; k++) {
+      pos.push(-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0);
+      ks.push(k, k, k, k);
+      idx.push(k * 4, k * 4 + 1, k * 4 + 2, k * 4, k * 4 + 2, k * 4 + 3);
+    }
+    quad.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    quad.setAttribute('aK', new THREE.Float32BufferAttribute(ks, 1));
+    quad.setIndex(idx);
     this.aP = new THREE.InstancedBufferAttribute(new Float32Array(max * 4), 4); // x y z r
     this.aD = new THREE.InstancedBufferAttribute(new Float32Array(max * 4), 4); // dens heat dust seed
     this.aP.setUsage(THREE.DynamicDrawUsage); this.aD.setUsage(THREE.DynamicDrawUsage);
@@ -49,30 +80,37 @@ export class SmokeVolume {
     quad.instanceCount = 0;
     this.splatGeo = quad;
     this.splatMat = new THREE.ShaderMaterial({
-      uniforms: { uSliceY: { value: 0 }, uOrigin: { value: new THREE.Vector3(VOL.ox, VOL.oy, VOL.oz) }, uSize: { value: new THREE.Vector3(VOL.sx, VOL.sy, VOL.sz) } },
+      uniforms: {
+        uOrigin: { value: new THREE.Vector3(VOL.ox, VOL.oy, VOL.oz) }, uSize: { value: new THREE.Vector3(VOL.sx, VOL.sy, VOL.sz) },
+        uCell: { value: VOL.cell }, uTiles: { value: this.dens.tiles }, uGrid: { value: this.dens.grid },
+      },
       depthTest: false, depthWrite: false, transparent: true,
       blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor, blendSrcAlpha: THREE.OneFactor, blendDstAlpha: THREE.OneFactor,
       vertexShader: /* glsl */ `
         attribute vec4 aP, aD;
-        uniform float uSliceY; uniform vec3 uOrigin, uSize;
-        varying vec2 vC; varying vec4 vD; varying float vR;
+        attribute float aK;
+        uniform float uCell; uniform vec3 uOrigin, uSize, uGrid; uniform vec2 uTiles;
+        varying vec2 vC, vT; varying vec4 vD; varying float vR;
         void main() {
-          float dy = uSliceY - aP.y;
           float r = aP.w;
+          float j = floor((aP.y - r - uOrigin.y) / uCell - 0.5) + 1.0 + aK; // k-th slice above the sphere's bottom
+          float dy = uOrigin.y + (j + 0.5) * uCell - aP.y;
           float rs2 = r * r - dy * dy;
-          if (rs2 <= 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+          if (rs2 <= 0.0 || j < 0.0 || j >= uGrid.y) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
           float rs = sqrt(rs2);
           vec2 c = position.xy;
           vec2 w = aP.xz + c * rs;
-          vec2 ndc = (w - uOrigin.xz) / uSize.xz * 2.0 - 1.0;
+          vT = (w - uOrigin.xz) / uSize.xz;    // position inside the slice tile
           vC = c * rs / r;                     // normalised 3D radius in the slice plane
           vR = dy / r;
           vD = aD;
-          gl_Position = vec4(ndc, 0.0, 1.0);
+          vec2 tile = vec2(mod(j, uTiles.x), floor(j / uTiles.x));
+          gl_Position = vec4((tile + vT) / uTiles * 2.0 - 1.0, 0.0, 1.0);
         }`,
       fragmentShader: /* glsl */ `
-        varying vec2 vC; varying vec4 vD; varying float vR;
+        varying vec2 vC, vT; varying vec4 vD; varying float vR;
         void main() {
+          if (any(lessThan(vT, vec2(0.0))) || any(greaterThan(vT, vec2(1.0)))) discard; // stay inside the tile
           float q = 1.0 - (dot(vC, vC) + vR * vR);
           if (q <= 0.0) discard;
           float k = q * q;
@@ -87,24 +125,30 @@ export class SmokeVolume {
     // --------------------------------------------------------------- light
     this.lightMat = new THREE.ShaderMaterial({
       uniforms: {
-        uDens: { value: this.dens.texture }, uSliceY: { value: 0 }, uSunDir: shared.uSunDir, uFlamePos: shared.uFlamePos,
+        uDens: { value: this.dens.texture }, uSunDir: shared.uSunDir, uFlamePos: shared.uFlamePos,
         uOrigin: { value: new THREE.Vector3(VOL.ox, VOL.oy, VOL.oz) }, uSize: { value: new THREE.Vector3(VOL.sx, VOL.sy, VOL.sz) },
+        uDGrid: { value: this.dens.grid }, uDTiles: { value: this.dens.tiles },
+        uLGrid: { value: this.light.grid }, uLTiles: { value: this.light.tiles }, uCell: { value: VOL.cell }, uRows: { value: 1 },
       },
       depthTest: false, depthWrite: false,
-      vertexShader: FS_VERT,
+      // only the atlas rows holding slices up to the smoke top are drawn
+      vertexShader: 'uniform float uRows; void main(){ gl_Position = vec4(position.x, (position.y + 1.0) * uRows - 1.0, 0.0, 1.0); }',
       fragmentShader: /* glsl */ `
-        precision highp sampler3D;
-        uniform sampler3D uDens;
-        uniform float uSliceY;
-        uniform vec3 uSunDir, uFlamePos, uOrigin, uSize;
-        varying vec2 vUv;
+        uniform sampler2D uDens;
+        uniform float uCell;
+        uniform vec3 uSunDir, uFlamePos, uOrigin, uSize, uDGrid, uLGrid;
+        uniform vec2 uDTiles, uLTiles;
+        ${VOL_TEX}
         float D(vec3 p) {
           vec3 u = (p - uOrigin) / uSize;
           if (any(lessThan(u, vec3(0.0))) || any(greaterThan(u, vec3(1.0)))) return 0.0;
-          return min(texture(uDens, u.xzy).r, 3.0);
+          return min(volTex(uDens, u, uDGrid, uDTiles).r, 3.0);
         }
         void main() {
-          vec3 p = vec3(uOrigin.x + vUv.x * uSize.x, uSliceY, uOrigin.z + vUv.y * uSize.z);
+          vec2 tile = floor(gl_FragCoord.xy / uLGrid.xz);
+          vec2 uv = (gl_FragCoord.xy - tile * uLGrid.xz) / uLGrid.xz;
+          float j = tile.y * uLTiles.x + tile.x;
+          vec3 p = vec3(uOrigin.x + uv.x * uSize.x, uOrigin.y + (j + 0.5) * uCell * 2.0, uOrigin.z + uv.y * uSize.z);
           float od = 0.0;
           float st = 9.0;
           vec3 q = p;
@@ -131,6 +175,7 @@ export class SmokeVolume {
     this.uniforms = {
       ...shared,
       uDens: { value: this.dens.texture }, uLight: { value: this.light.texture }, uNoise: { value: noiseTex },
+      uDGrid: { value: this.dens.grid }, uDTiles: { value: this.dens.tiles }, uLGrid: { value: this.light.grid }, uLTiles: { value: this.light.tiles },
       uOrigin: { value: new THREE.Vector3(VOL.ox, VOL.oy, VOL.oz) }, uSize: { value: new THREE.Vector3(VOL.sx, VOL.sy, VOL.sz) },
       uDepth: { value: null }, uLogFar: { value: Math.log2(2e6 + 1) }, uRes: { value: new THREE.Vector2(1, 1) },
       uInvProj: { value: new THREE.Matrix4() }, uCamWorld: { value: new THREE.Matrix4() }, uCamFwd: { value: new THREE.Vector3() },
@@ -198,8 +243,11 @@ export class SmokeVolume {
           layout(location = 0) out vec4 outBack;
           layout(location = 1) out vec4 outFront;
         #endif
-        uniform sampler3D uDens, uLight, uNoise;
-        uniform sampler2D uDepth;
+        uniform sampler3D uNoise;
+        uniform sampler2D uDens, uLight, uDepth;
+        uniform vec3 uDGrid, uLGrid;
+        uniform vec2 uDTiles, uLTiles;
+        ${VOL_TEX}
         uniform float uLogFar, uSimTime;
         uniform vec2 uRes;
         uniform vec3 uOrigin, uSize, uCamFwd, uWind, uBoxMin, uBoxMax;
@@ -280,7 +328,7 @@ export class SmokeVolume {
             if (i >= uSteps || t > tMax || T < 0.01) break;
             vec3 p = ro + rd * t;
             vec3 u = (p - uOrigin) / uSize;
-            vec4 v = texture(uDens, u.xzy);
+            vec4 v = volTex(uDens, u, uDGrid, uDTiles);
             float base = v.r;
             if (base > 0.004) {
               // fractal erosion: big billows -> lobes -> small cauliflower curls
@@ -297,7 +345,7 @@ export class SmokeVolume {
               float edge = cov - (1.0 - er) * 1.05;
               float dens = smoothstep(0.0, 0.06, edge) * (0.6 + dn * 0.8);
               if (dens > 0.001) {
-                vec4 L = texture(uLight, u.xzy);
+                vec4 L = volTex(uLight, u, uLGrid, uLTiles);
                 float odS = L.r * SIGMA;
                 float odF = L.g * SIGMA;
                 float occ = L.b;
@@ -386,7 +434,8 @@ export class SmokeVolume {
   gather(ps) {
     const P = this.aP.array, D = this.aD.array;
     let n = 0;
-    const minR = VOL.cell * 1.25;
+    const minR = VOL.cell * 1.25, maxR = (SPLAT_K - 1) * VOL.cell * 0.5;
+    let rMax = 0;
     for (let i = 0; i < ps.count && n < this.max; i++) {
       if (ps.kind[i] !== KIND.SMOKE) continue;
       const x = ps.p[i * 3], y = ps.p[i * 3 + 1], z = ps.p[i * 3 + 2];
@@ -396,6 +445,8 @@ export class SmokeVolume {
       let r = ps.size[i] * 1.15;
       let m = op * ps.dens[i] * 0.9;
       if (r < minR) { m *= (r / minR) ** 3; r = minR; } // conserve mass for sub-voxel puffs
+      if (r > maxR) r = maxR;
+      if (r > rMax) rMax = r;
       // gas temperature above ambient; the glowing core cools by mixing within ~1-2 s
       const hot = ps.hot[i] > 0 ? Math.max(0, (ps.hot[i] * Math.exp(-ps.age[i] / (ps.heatT ? ps.heatT[i] : 1.2)) - 350) / 1400) : 0;
       P[n * 4] = x; P[n * 4 + 1] = y; P[n * 4 + 2] = z; P[n * 4 + 3] = r;
@@ -403,6 +454,8 @@ export class SmokeVolume {
       n++;
     }
     this.splatGeo.instanceCount = n;
+    // draw only as many slice quads per puff as the largest puff needs
+    this.splatGeo.setDrawRange(0, Math.min(SPLAT_K, Math.floor((2 * rMax) / VOL.cell) + 2) * 6);
     this.aP.clearUpdateRanges(); this.aP.addUpdateRange(0, Math.max(1, n) * 4); this.aP.needsUpdate = true;
     this.aD.clearUpdateRanges(); this.aD.addUpdateRange(0, Math.max(1, n) * 4); this.aD.needsUpdate = true;
     this.count = n;
@@ -423,24 +476,25 @@ export class SmokeVolume {
 
   build() {
     const r = this.renderer;
-    const prevClear = r.getClearColor(new THREE.Color()), prevAlpha = r.getClearAlpha();
+    if (!this.active && !this.dirty) return; // volumes already empty
+    const prevClear = r.getClearColor(_c), prevAlpha = r.getClearAlpha();
     r.setClearColor(0x000000, 0);
-    const { ny, cell, oy } = VOL;
-    const topSlice = Math.min(ny, Math.ceil((this.top - oy) / cell) + 1);
-    for (let j = 0; j < ny; j++) {
-      r.setRenderTarget(this.dens, j);
-      r.clear();
-      if (j > topSlice || !this.active) continue;
-      this.splatMat.uniforms.uSliceY.value = oy + (j + 0.5) * cell;
-      r.render(this.splatScene, this.cam);
-    }
-    const lTop = Math.min(this.lny, Math.ceil(topSlice / 2) + 2);
-    for (let j = 0; j < this.lny; j++) {
-      r.setRenderTarget(this.light, j);
-      if (j > lTop || !this.active) { r.clear(); continue; }
-      this.lightMat.uniforms.uSliceY.value = oy + (j + 0.5) * cell * 2;
+    prof.begin('smoke.splat');
+    r.setRenderTarget(this.dens);
+    r.clear();
+    if (this.active) r.render(this.splatScene, this.cam);
+    prof.end();
+    prof.begin('smoke.light');
+    r.setRenderTarget(this.light);
+    r.clear();
+    if (this.active) {
+      const topSlice = Math.min(VOL.ny, Math.ceil((this.top - VOL.oy) / VOL.cell) + 1);
+      const lTop = Math.min(this.lny - 1, Math.ceil(topSlice / 2) + 2);
+      this.lightMat.uniforms.uRows.value = Math.ceil((lTop + 1) / this.light.tiles.x) / this.light.tiles.y;
       r.render(this.lightScene, this.cam);
     }
+    prof.end();
+    this.dirty = this.active;
     r.setClearColor(prevClear, prevAlpha);
   }
 

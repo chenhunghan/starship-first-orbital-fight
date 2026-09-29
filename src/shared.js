@@ -13,6 +13,7 @@ export const shared = {
   uTime: { value: 0 },
   uCoverage: { value: 0.68 },
   uCloudTime: { value: 0 },
+  uWeather: { value: null }, // baked cloud weather field (clouds.js)
   uSunColor: { value: new THREE.Vector3(10, 10, 10) },
   uSkyAmb: { value: new THREE.Vector3(1, 1, 1) },
   uGroundAmb: { value: new THREE.Vector3(0.2, 0.2, 0.2) },

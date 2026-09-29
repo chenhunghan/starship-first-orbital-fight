@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { FlightSim, LAUNCH_AZIMUTH, OMEGA, RE } from './physics.js';
 import { Plasma } from './reentry.js';
+import { StarlinkDeploy, DEPLOY_START, DEPLOY_END } from './starlink.js';
 import { createSky, computeLighting, atmosParams } from './sky.js';
 import { createTerrain } from './terrain.js';
 import { createPad, MOUNT_HEIGHT } from './pad.js';
@@ -13,9 +14,11 @@ import { Pipeline } from './post.js';
 import { LaunchAudio } from './audio.js';
 import { shared } from './shared.js';
 import { createUI } from './ui.js';
-import { createClouds } from './clouds.js';
+import { createClouds, bakeWeather } from './clouds.js';
 import { SmokeVolume, insideVolume } from './smoke.js';
 import { sunTransmittanceJS } from './sky.js';
+import { prof } from './prof.js';
+import { QualityGovernor } from './governor.js';
 
 // ------------------------------------------------------------------ setup
 const canvas = document.getElementById('c');
@@ -24,6 +27,7 @@ renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 renderer.toneMapping = THREE.NoToneMapping;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.shadowMap.autoUpdate = false; // re-rendered on demand (updateShadowCache)
 renderer.autoClear = true;
 
 const FAR = 2e6;
@@ -39,11 +43,19 @@ const QUALITY = {
   ultra: { smokeSteps: 150, smokeScale: 0.75, cloudScale: 0.6, clouds: 160, scale: Math.min(window.devicePixelRatio || 1, 2), part: 0.75, refl: 0.6, shadow: 4096, msaa: 4, emit: 1.0, sky: 20, lighting: 0.5, maxParticles: 16000 },
 };
 const params = new URLSearchParams(location.search);
+// ?prof (GPU timer queries), ?prof=sync (exact, serialised), ?prof=cpu; window.__prof.report()
+prof.init(renderer.getContext(), params.has('prof') && (params.get('prof') || true));
+if (prof.enabled) {
+  const sm = renderer.shadowMap, r0 = sm.render.bind(sm);
+  sm.render = (...a) => { if ((!sm.needsUpdate && !sm.autoUpdate) || !a[0].length) return r0(...a); prof.begin('shadow'); r0(...a); prof.end(); };
+}
 let qualityName = params.get('q') || (/(iPhone|iPad|Android)/i.test(navigator.userAgent) ? 'low' : 'high');
 let Q = QUALITY[qualityName] || QUALITY.high;
+// keeps >= 30 fps by trading internal resolution (never above the preset; ?nogov disables)
+const gov = new QualityGovernor({ targetFps: 30, enabled: !params.has('nogov') });
 
 // sky & light
-const sky = createSky();
+const sky = createSky(renderer);
 scene.add(sky.mesh);
 const sun = new THREE.DirectionalLight(0xffffff, 1);
 sun.castShadow = true;
@@ -69,6 +81,8 @@ const shipPlume = new Plume(ship.layout, { clusterR: 3.0, gain: 0.9 });
 pscene.add(boosterPlume.group, shipPlume.group);
 const plasma = new Plasma();
 pscene.add(plasma.group);
+const starlink = new StarlinkDeploy();
+scene.add(starlink.group);
 
 const ps = new ParticleSystem(QUALITY.high.maxParticles + 4000);
 pscene.add(ps.farMesh, ps.nearMesh);
@@ -132,6 +146,7 @@ const cubeRT = new THREE.WebGLCubeRenderTarget(128, { type: THREE.HalfFloatType 
 const cubeCam = new THREE.CubeCamera(1, FAR, cubeRT);
 let envDirty = true, envRT = null;
 function updateEnvironment() {
+  prof.begin('env');
   booster.group.visible = ship.group.visible = false;
   sky.uniforms.uSunDisc.value = 0;
   cubeCam.position.set(40, 70, 60);
@@ -144,6 +159,39 @@ function updateEnvironment() {
   booster.group.visible = ship.group.visible = true;
   envDirty = false;
   envSun.copy(sunDir);
+  prof.end();
+}
+
+// ------------------------------------------------------------------ shadow cache
+// The sun shadow map is only re-rendered when the sun moved or a shadow caster inside the
+// shadow frustum moved, appeared or vanished (the pad itself is static).
+const shadowCache = { sig: NaN, casters: [], n: -1 };
+const _sph = new THREE.Sphere();
+const worldVisible = (o) => { for (; o; o = o.parent) if (!o.visible) return false; return true; };
+function updateShadowCache() {
+  if (shadowCache.n !== scene.children.length) {
+    shadowCache.n = scene.children.length;
+    shadowCache.casters = [];
+    for (const c of scene.children) {
+      if (c === pad) continue;
+      c.traverse((o) => { if (o.isMesh && o.castShadow) { if (!o.geometry.boundingSphere) o.geometry.computeBoundingSphere(); shadowCache.casters.push(o); } });
+    }
+  }
+  for (const c of scene.children) if (c !== pad && c !== terrain && c !== sky.mesh) c.updateMatrixWorld();
+  sun.updateMatrixWorld(); sun.target.updateMatrixWorld();
+  sun.shadow.updateMatrices(sun);
+  const fr = sun.shadow.getFrustum();
+  const p = sun.position, q = sun.target.position;
+  let sig = p.x + p.y * 3 + p.z * 7 + q.x * 11 + q.y * 13 + q.z * 17 + (pad.visible ? 0.5 : 0) + sun.shadow.mapSize.x;
+  for (const m of shadowCache.casters) {
+    if (!worldVisible(m)) continue;
+    _sph.copy(m.geometry.boundingSphere).applyMatrix4(m.matrixWorld);
+    if (!fr.intersectsSphere(_sph)) continue;
+    const e = m.matrixWorld.elements;
+    sig = sig * 1.000123 + 1;
+    for (let k = 0; k < 16; k++) sig += Math.round(e[k] * 1e4) * (k + 1.37); // ignore sub-mm pose jitter
+  }
+  if (sig !== shadowCache.sig) { shadowCache.sig = sig; renderer.shadowMap.needsUpdate = true; }
 }
 
 // ------------------------------------------------------------------ camera
@@ -319,17 +367,24 @@ function advance(simDt) {
   while (left > 1e-6) {
     const d = Math.min(chunk, left);
     simAcc += d;
+    prof.cbegin('physics');
     while (simAcc >= STEP) { sim.step(STEP); simAcc -= STEP; }
     updatePoses(d);
+    prof.cend();
+    prof.cbegin('effects');
     effects.update(d, {
-      sim, quality: Q.emit, stacked: sim.stacked,
+      sim, quality: Q.emit, stacked: sim.stacked, atPad: anchorAngle === 0,
       boosterPos: pose.boosterPos, boosterQuat: pose.boosterQuat, boosterVel: pose.boosterVel,
       shipPos: pose.shipPos, shipQuat: pose.shipQuat, shipVel: pose.shipVel, shipAxis: pose.shipAxis,
       boosterPlume, shipPlume, shipThrust: sim.ship.engines.reduce((a, e) => a + e.level, 0) / 6,
     });
+    prof.cend();
+    prof.cbegin('ps.update');
     ps.update(d);
+    prof.cend();
     left -= d;
   }
+  ps.driftClouds(simDt);
 }
 
 // automatic time-warp through the long quiet parts of the mission (coast, orbit, entry)
@@ -347,6 +402,8 @@ function autoWarpFactor() {
       const toDeorbit = sim.deorbitT - sim.t;
       if (toDeorbit < 20) return 1;
       if (toDeorbit < 400) return 10;
+      // slow down while the Starlink V3 satellites leave the payload door
+      if (sim.t > DEPLOY_START - 30 && sim.t < DEPLOY_END + 60) return 12;
       return 60;
     }
     case 'insertion': case 'deorbit': return 1;
@@ -384,24 +441,30 @@ function setQuality(name) {
   pipeline.params.reflScale = Q.refl;
   pipeline.params.msaa = Q.msaa;
   sky.uniforms.uSteps.value = Q.sky;
-  clouds.uniforms.uSteps.value = Q.clouds;
-  smoke.uniforms.uSteps.value = Q.smokeSteps;
+  gov.set(0); gov.reset();
+  applySteps();
   if (sun.shadow.map && sun.shadow.mapSize.x !== Q.shadow) { sun.shadow.map.dispose(); sun.shadow.map = null; }
   sun.shadow.mapSize.set(Q.shadow, Q.shadow);
   resize();
   ui.setQuality(name);
 }
 
+function applySteps() {
+  clouds.uniforms.uSteps.value = Math.round(Q.clouds * gov.steps);
+  smoke.uniforms.uSteps.value = Math.round(Q.smokeSteps * gov.steps);
+}
+
 // ------------------------------------------------------------------ resize
 function resize() {
   const w = window.innerWidth, h = window.innerHeight;
+  const k = Q.scale * gov.scale;
   renderer.setPixelRatio(1);
-  renderer.setSize(Math.floor(w * Q.scale), Math.floor(h * Q.scale), false);
+  renderer.setSize(Math.floor(w * k), Math.floor(h * k), false);
   canvas.style.width = w + 'px';
   canvas.style.height = h + 'px';
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
-  pipeline.setSize(Math.floor(w * Q.scale), Math.floor(h * Q.scale));
+  pipeline.setSize(Math.floor(w * k), Math.floor(h * k));
   shared.uResolution.value.set(pipeline.w, pipeline.h);
   clouds.setSize(pipeline.w * Q.cloudScale, pipeline.h * Q.cloudScale);
   smoke.setSize(pipeline.w * Q.smokeScale, pipeline.h * Q.smokeScale);
@@ -412,7 +475,7 @@ window.addEventListener('resize', resize);
 const mirror = new THREE.PerspectiveCamera();
 const reflMatrix = new THREE.Matrix4();
 const bias = new THREE.Matrix4().set(0.5, 0, 0, 0.5, 0, 0.5, 0, 0.5, 0, 0, 0.5, 0.5, 0, 0, 0, 1);
-const _d = new THREE.Vector3(), _u = new THREE.Vector3();
+const _d = new THREE.Vector3(), _u = new THREE.Vector3(), _res = new THREE.Vector2();
 function renderReflection() {
   mirror.copy(camera);
   mirror.position.set(camera.position.x, -camera.position.y, camera.position.z);
@@ -428,24 +491,64 @@ function renderReflection() {
   terrain.visible = false;
   sky.mesh.position.copy(mirror.position);
   sky.uniforms.uCamAlt.value = 2;
-  const ss = renderer.shadowMap.autoUpdate;
-  renderer.shadowMap.autoUpdate = false;
   renderer.setRenderTarget(pipeline.refl);
+  prof.begin('refl.scene');
   renderer.render(scene, mirror);
+  prof.end();
+  prof.begin('refl.clouds');
   clouds.renderReflection(renderer, mirror);
+  prof.end();
   smoke.compBack.visible = smoke.compFront.visible = false;
+  prof.begin('refl.smoke');
   smoke.renderReflection(mirror);
+  prof.end();
   ps.setReflectionMode(true); boosterPlume.setReflectionMode(true); shipPlume.setReflectionMode(true);
   clouds.mesh.visible = false;
   renderer.autoClear = false;
+  prof.begin('refl.part');
   renderer.render(pscene, mirror);
+  prof.end();
   renderer.autoClear = true;
   ps.setReflectionMode(false); boosterPlume.setReflectionMode(false); shipPlume.setReflectionMode(false);
   clouds.mesh.visible = true;
   smoke.compBack.visible = smoke.compFront.visible = true;
-  renderer.shadowMap.autoUpdate = ss;
   terrain.visible = true;
   shared.uReflection.value = pipeline.refl.texture;
+}
+
+// depth prepass for the reduced-res passes (soft particles, plumes, clouds, smoke): the opaque
+// scene, depth only, without MSAA (resolving the MSAA float depth of the main pass is slow on
+// tile GPUs). Log depth like the main pass; transparent objects and the sky write no depth.
+const depthMats = {};
+function depthMaterial(side, isTerrain) {
+  const k = side + (isTerrain ? 't' : '');
+  if (!depthMats[k]) {
+    const m = new THREE.MeshBasicMaterial({ colorWrite: false, side });
+    if (isTerrain) { // same Earth-curvature drop as the terrain material
+      m.onBeforeCompile = (sh) => {
+        sh.vertexShader = sh.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\n{ vec2 f = (modelMatrix * vec4(transformed, 1.0)).xz; transformed.y -= dot(f, f) / (2.0 * 6371000.0); }');
+      };
+      m.customProgramCacheKey = () => 'terrainDepth';
+    }
+    depthMats[k] = m;
+  }
+  return depthMats[k];
+}
+const _swap = [];
+function renderDepth() {
+  _swap.length = 0;
+  scene.traverseVisible((o) => {
+    if (!o.isMesh) return;
+    const m = o.material, m0 = Array.isArray(m) ? m[0] : m;
+    const hide = o === sky.mesh || m0.transparent || !m0.depthWrite || !m0.visible;
+    _swap.push(o, m, hide);
+    if (hide) o.visible = false;
+    else o.material = depthMaterial(m0.side, o === terrain);
+  });
+  renderer.setRenderTarget(pipeline.depth);
+  renderer.render(scene, camera);
+  for (let i = 0; i < _swap.length; i += 3) { if (_swap[i + 2]) _swap[i].visible = true; else _swap[i].material = _swap[i + 1]; }
+  _swap.length = 0;
 }
 
 let frameCount = 0;
@@ -454,51 +557,73 @@ const _sunTmp = new THREE.Vector3(), envSun = new THREE.Vector3();
 let lastLightT = 0, lastEnvT = 0;
 const DBG = { refl: !params.has('norefl'), clouds: !params.has('noclouds'), smoke: !params.has('nosmoke'), part: !params.has('nopart') };
 function render(time) {
-  // reflection first (sampled by the water in the main pass)
-  if (DBG.refl) renderReflection();
+  // reflection first (sampled by the water in the main pass; no terrain from high altitude)
+  if (DBG.refl && camera.position.y <= 45000) renderReflection();
   sky.mesh.position.copy(camera.position);
   sky.uniforms.uCamAlt.value = Math.max(1, camera.position.y);
   // from high altitude the whole Earth (surface + clouds) comes from the sky shader
   const high = camera.position.y > 45000;
   terrain.visible = !high;
   sky.uniforms.uPlanetOffset.value.set(anchorAngle * 900, 0, 0);
+  prof.begin('depth');
+  renderDepth();
+  prof.end();
   renderer.setRenderTarget(pipeline.main);
+  prof.begin('main');
   renderer.render(scene, camera);
+  prof.end();
 
-  // particles & plumes, manual depth test against the main depth buffer
-  const res = new THREE.Vector2(pipeline.part.width, pipeline.part.height);
-  ps.uniforms.uDepth.value = pipeline.main.depthTexture;
+  // particles & plumes, manual depth test against the depth prepass
+  const depth = pipeline.depth.depthTexture;
+  const res = _res.set(pipeline.part.width, pipeline.part.height);
+  ps.uniforms.uDepth.value = depth;
   ps.uniforms.uPartRes.value.copy(res);
   ps.uniforms.uLogFar.value = Math.log2(FAR + 1);
-  boosterPlume.setDepth(pipeline.main.depthTexture, res, Math.log2(FAR + 1));
-  if (DBG.clouds && !high) clouds.render(renderer, camera, pipeline.main.depthTexture);
+  boosterPlume.setDepth(depth, res, Math.log2(FAR + 1));
+  prof.begin('clouds');
+  if (DBG.clouds && !high) clouds.render(renderer, camera, depth);
+  prof.end();
   clouds.mesh.visible = !high;
-  if (DBG.smoke) smoke.render(camera, pipeline.main.depthTexture, boosterPlume.axis, ps.time);
-  shipPlume.setDepth(pipeline.main.depthTexture, res, Math.log2(FAR + 1));
-  plasma.setDepth(pipeline.main.depthTexture, res, Math.log2(FAR + 1));
+  prof.begin('smoke.march');
+  if (DBG.smoke) smoke.render(camera, depth, boosterPlume.axis, ps.time);
+  prof.end();
+  shipPlume.setDepth(depth, res, Math.log2(FAR + 1));
+  plasma.setDepth(depth, res, Math.log2(FAR + 1));
+  prof.begin('part');
   renderer.setRenderTarget(pipeline.part);
   renderer.setClearColor(0x000000, 0);
   renderer.clear();
   renderer.autoClear = false;
   if (DBG.part) renderer.render(pscene, camera);
   renderer.autoClear = true;
+  prof.end();
 
   pipeline.params.exposure = baseExposure * Math.pow(2, userEV);
+  prof.begin('post');
   pipeline.finish(time);
+  prof.end();
   frameCount++;
 }
 
 // ------------------------------------------------------------------ loop
 let last = performance.now();
 let fpsAcc = 0, fpsN = 0, eventsShown = 0;
-const shakeQ = new THREE.Quaternion(), saveQ = new THREE.Quaternion();
+const shakeQ = new THREE.Quaternion(), saveQ = new THREE.Quaternion(), shakeE = new THREE.Euler();
+const _nozzle = new THREE.Vector3(), _fire = new THREE.Vector3(), _off = new THREE.Vector3(), _origin = new THREE.Vector3();
 let started = false;
+// ?fixdt: deterministic virtual clock (1/60 s per frame, frozen while paused) for reproducible captures
+const FIXDT = params.has('fixdt');
+let vclock = 0;
+let cpuMs = 0;
 function tick(now) {
   requestAnimationFrame(tick);
+  const t0 = performance.now();
+  if (FIXDT) { if (!paused) vclock += 1000 / 60; now = vclock; last = Math.min(last, now - 1000 / 60); }
+  if (gov.sample(now - last, cpuMs, seeking !== null || !started)) { resize(); applySteps(); }
   const dtReal = Math.min(0.1, (now - last) / 1000);
   last = now;
   fpsAcc += dtReal; fpsN++;
-  if (fpsAcc > 0.5) { ui.setFps(fpsN / fpsAcc); fpsAcc = 0; fpsN = 0; }
+  if (fpsAcc > 0.5) { ui.setFps(fpsN / fpsAcc, gov.scale); fpsAcc = 0; fpsN = 0; }
 
   let scale = paused || !started ? 0 : timeScale * (autoWarp ? autoWarpFactor() : 1);
   ui.setWarp(autoWarp && scale > timeScale * 1.01 ? scale : 0);
@@ -507,6 +632,7 @@ function tick(now) {
     if (sim.t >= seeking) { seeking = null; if (params.has('pause')) { paused = true; ui.setPaused(true); } }
   }
   const simDt = dtReal * scale;
+  prof.cbegin('cpu.frame');
   advance(simDt);
 
   // scene anchor follows the tracked stage far downrange; the local sun moves with
@@ -532,6 +658,7 @@ function tick(now) {
   boosterPlume.update(booster.group.matrixWorld, bLev, sim.booster.telemetry.pa, camera, Q.emit);
   shipPlume.update(ship.group.matrixWorld, sLev, sim.ship.telemetry.pa, camera, Q.emit);
   plasma.update(ship.group, pose.shipVel, sim.ship.heat || 0, camera);
+  starlink.update(sim.t, ship.group, sim.ship.active && anchorAngle !== 0);
   ship.materials.tiles.userData.uniforms && (ship.materials.tiles.userData.uniforms.uHeat.value = Math.min(1, (sim.ship.heat || 0) * 1.1));
   booster.materials.ringMat.userData.shader && (booster.materials.ringMat.userData.shader.uniforms.uVentGlow.value =
     sim.flags['Hot staging'] && sim.t - (sim.stageTime ?? 0) < 4 ? Math.max(0, 1 - (sim.t - sim.stageTime) / 4) : 0);
@@ -551,8 +678,8 @@ function tick(now) {
 
   const thrust = bLev.reduce((a, b) => a + b, 0) / 33;
   const bh = pose.boosterPos.y;
-  const nozzle = new THREE.Vector3(0, -2, 0).applyQuaternion(pose.boosterQuat).add(pose.boosterPos);
-  const fire = new THREE.Vector3(nozzle.x, Math.max(4, Math.min(nozzle.y - 25, nozzle.y * 0.5)), nozzle.z);
+  const nozzle = _nozzle.set(0, -2, 0).applyQuaternion(pose.boosterQuat).add(pose.boosterPos);
+  const fire = _fire.set(nozzle.x, Math.max(4, Math.min(nozzle.y - 25, nozzle.y * 0.5)), nozzle.z);
   const flicker = 0.85 + 0.15 * Math.sin(now * 0.05) * Math.sin(now * 0.031);
   let fI = thrust * flicker * (bh < 3000 ? 1 : 0.3) * (anchorAngle === 0 ? 1 : 0);
   // splashdown fireball lights the water & smoke
@@ -583,7 +710,7 @@ function tick(now) {
   if (anchorAngle === 0) spaceFramed = false;
   if (cam.mode === 'chase' || (anchorAngle !== 0 && (cam.mode === 'track' || cam.mode === 'fixed'))) {
     // keep the user's orbit offset, but lock the target onto the vehicle
-    const off = camera.position.clone().sub(controls.target);
+    const off = _off.copy(camera.position).sub(controls.target);
     controls.target.copy(focus);
     camera.position.copy(focus).add(off);
   } else if (cam.mode === 'track') {
@@ -609,9 +736,8 @@ function tick(now) {
   camera.updateProjectionMatrix();
 
   // sun shadow frustum around the pad (or the low vehicle)
-  const sTarget = bh < 1500 ? new THREE.Vector3(0, 0, 0) : new THREE.Vector3(0, 0, 0);
-  sun.target.position.copy(sTarget);
-  sun.position.copy(sTarget).addScaledVector(sunDir, 3000);
+  sun.target.position.copy(_origin);
+  sun.position.copy(_origin).addScaledVector(sunDir, 3000);
 
   // audio & camera shake (sound arrives at 343 m/s)
   audio.record(sim.t, [
@@ -623,28 +749,35 @@ function tick(now) {
   const shake = Math.min(1, loud) * (cam.mode === 'onboard' ? 0.0 : 0.0035) * (cam.fov === 'auto' || lensFov < 10 ? 0.3 : 1);
   if (shake > 0) {
     const tt = now * 0.001;
-    shakeQ.setFromEuler(new THREE.Euler(Math.sin(tt * 37) * shake * Math.sin(tt * 5.1), Math.sin(tt * 43 + 1) * shake * Math.sin(tt * 3.7), 0));
+    shakeQ.setFromEuler(shakeE.set(Math.sin(tt * 37) * shake * Math.sin(tt * 5.1), Math.sin(tt * 43 + 1) * shake * Math.sin(tt * 3.7), 0));
     camera.quaternion.multiply(shakeQ);
   }
   camera.updateMatrixWorld();
 
   // particle lighting & sorting
-  ps.rebuildGrid();
-  ps.updateLighting(Q.lighting);
-  ps.upload(camera, [boosterPlume.axis, shipPlume.axis]);
-  smoke.gather(ps);
-  smoke.build();
+  prof.cbegin('ps.grid'); ps.rebuildGrid(); prof.cend();
+  prof.cbegin('ps.lighting'); ps.updateLighting(Q.lighting); prof.cend();
+  prof.cbegin('ps.upload'); ps.upload(camera, [boosterPlume.axis, shipPlume.axis]); prof.cend();
+  prof.cbegin('smoke.gather'); smoke.gather(ps); prof.cend();
+  prof.cbegin('smoke.build'); smoke.build(); prof.cend();
 
   shared.uTime.value = now * 0.001;
   shared.uCloudTime.value = now * 0.001;
   sky.uniforms.uTime.value = now * 0.001;
+  updateShadowCache();
+  sky.updateLUT();
   if (envDirty) updateEnvironment();
+  prof.cbegin('render.submit');
   render(now * 0.001);
+  prof.cend();
   camera.quaternion.copy(saveQ);
 
   // HUD
   ui.update(sim, timeScale);
   while (eventsShown < sim.events.length) ui.pushEvent(sim.events[eventsShown++]);
+  prof.cend();
+  prof.endFrame(dtReal * 1000);
+  cpuMs = performance.now() - t0;
 }
 
 // ------------------------------------------------------------------ boot
@@ -652,6 +785,7 @@ function boot() {
   resize();
   setQuality(qualityName);
   ps.uniforms.uAtlas.value = createPuffAtlas(renderer);
+  bakeWeather(renderer);
   setSun(sunState.el, sunState.az);
   updatePoses(0);
   setCamera(CAMS[0]);
@@ -668,7 +802,9 @@ function boot() {
     const c = { id: 'custom', name: 'Custom', mode: 'free', pos: params.get('campos').split(',').map(Number), target: (params.get('camtgt') || '0,60,0').split(',').map(Number), fov: +(params.get('fov') || 40) };
     setCamera(c);
   }
-  window.__app = { scene, booster, ship, terrain, clouds, seekingDone: () => seeking === null && started, sim, ps, camera, controls, seek, setCamera, CAMS, renderer, pipeline, setSun, setQuality };
+  window.__app = { scene, booster, ship, terrain, clouds, seekingDone: () => seeking === null && started, sim, ps, camera, controls, seek, setCamera, CAMS, renderer, pipeline, setSun, setQuality,
+    smoke, sky, sun, pscene, boosterPlume, shipPlume, plasma, DBG, Q: () => Q, governor: gov };
+  window.__prof = prof;
 }
 boot();
 void atmosParams;

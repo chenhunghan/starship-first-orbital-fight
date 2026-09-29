@@ -10,6 +10,8 @@ import { Plume } from './plume.js';
 // plasma spectrum seen on Starship's flap cameras (orange near the tiles,
 // pink/magenta N2+/O lines in the shock layer, violet at the edges).
 
+const _v = new THREE.Vector3(), _flow = new THREE.Vector3(), _c = new THREE.Vector3(), _down = new THREE.Vector3(0, -1, 0), _one = new THREE.Vector3(1, 1, 1), _M = new THREE.Matrix4();
+
 function plasmaMaterial(kind, reflection) {
   return new THREE.ShaderMaterial({
     uniforms: {
@@ -116,16 +118,16 @@ export class Plasma {
     const h = Math.max(0, Math.min(1.5, heat));
     this.group.visible = h > 0.02 && shipGroup.visible;
     if (!this.group.visible) return;
-    const v = velocity.lengthSq() > 1 ? velocity.clone().normalize() : new THREE.Vector3(0, -1, 0);
-    const flow = v.clone().negate();
+    const v = velocity.lengthSq() > 1 ? _v.copy(velocity).normalize() : _v.copy(_down);
+    const flow = _flow.copy(v).negate();
     this.shellMat.uniforms.uHeat.value = h;
     this.shellMat.uniforms.uFlow.value.copy(flow);
     this.shell.position.copy(shipGroup.position);
     this.shell.quaternion.copy(shipGroup.quaternion);
     // wake starts at the windward belly and streams downstream (local -Y = flow)
-    const centre = new THREE.Vector3(0, 25, 0).applyQuaternion(shipGroup.quaternion).add(shipGroup.position);
-    this._q.setFromUnitVectors(new THREE.Vector3(0, -1, 0), flow);
-    const M = new THREE.Matrix4().compose(centre, this._q, new THREE.Vector3(1, 1, 1));
+    const centre = _c.set(0, 25, 0).applyQuaternion(shipGroup.quaternion).add(shipGroup.position);
+    this._q.setFromUnitVectors(_down, flow);
+    const M = _M.compose(centre, this._q, _one);
     this.wakePlume.fixedL = 260 + 260 * h;
     this.wakePlume.fixedTan = 0.09;
     this.wakePlume.update(M, [Math.min(1, h * h)], 0, camera, 0.8);

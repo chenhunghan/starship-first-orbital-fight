@@ -189,7 +189,7 @@ export function createUI(h) {
   ui.setSun = (e, a) => { el.value = e; az.value = a; $('elVal').textContent = `${e.toFixed(1)}°`; $('azVal').textContent = `${a}°`; };
   ui.setPaused = (p) => { $('play').textContent = p ? '▶' : '❚❚'; };
   ui.setSound = (on) => { $('sound').textContent = on ? '🔊' : '🔇'; };
-  ui.setFps = (f) => { $('fps').textContent = `${f.toFixed(0)} fps`; };
+  ui.setFps = (f, res = 1) => { $('fps').textContent = `${f.toFixed(0)} fps` + (res < 1 ? ` · ${Math.round(res * 100)}% res` : ''); };
   let lastWarp = -1;
   ui.setWarp = (w) => { const r = Math.round(w); if (r === lastWarp) return; lastWarp = r; $('warp').textContent = r > 1 ? `AUTO ${r}×` : ''; };
   $('autoWarp').onchange = (e) => h.onAutoWarp(e.target.checked);
