@@ -318,6 +318,7 @@ export class Plume {
     this.axis.length = L;
     this.axis.radius = this.clusterR + L * tanT * 0.5;
     this.axis.visible = avg > 0.01;
+    this.axis.level = avg * pr;
     this.group.visible = avg > 0.005;
     this.avg = avg;
     this.length = L;

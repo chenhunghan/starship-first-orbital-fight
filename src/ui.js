@@ -2,15 +2,25 @@
 
 const $ = (id) => document.getElementById(id);
 
+// Flight 14 profile (T+ seconds)
 const TIMELINE = [
   { t: 0, name: 'Liftoff' },
-  { t: 58, name: 'Max-Q' },
-  { t: 160, name: 'Hot staging' },
-  { t: 172, name: 'Boostback' },
-  { t: 395, name: 'Landing burn' },
-  { t: 474, name: 'SECO' },
+  { t: 60, name: 'Max-Q' },
+  { t: 142, name: 'Hot staging' },
+  { t: 150, name: 'Boostback' },
+  { t: 420, name: 'Booster splashdown' },
+  { t: 432, name: 'SECO' },
+  { t: 1540, name: 'Orbit insertion' },
+  { t: 2047, name: 'Starlink deploy' },
+  { t: 7938, name: 'Deorbit burn' },
+  { t: 9600, name: 'Entry' },
+  { t: 10550, name: 'Peak heating' },
+  { t: 11200, name: 'Flip & splashdown' },
 ];
-const T_START = -20, T_END = 520;
+const T_START = -20, T_END = 11300;
+// piecewise time axis: the first 10 minutes get half of the bar
+const axis = (t) => (t < 600 ? ((t - T_START) / (600 - T_START)) * 50 : 50 + ((t - 600) / (T_END - 600)) * 50);
+const axisInv = (p) => (p < 50 ? T_START + (p / 50) * (600 - T_START) : 600 + ((p - 50) / 50) * (T_END - 600));
 const SPEEDS = [
   { s: 0.25, l: '¼×' }, { s: 1, l: '1×' }, { s: 5, l: '5×' }, { s: 20, l: '20×' },
 ];
@@ -73,7 +83,7 @@ export function createUI(h) {
   el.oninput = sunDebounced; az.oninput = sunDebounced;
   document.querySelectorAll('[data-sun]').forEach((b) => {
     b.onclick = () => {
-      if (b.dataset.sun === 'morning') { el.value = 11; az.value = 102; } else { el.value = 8; az.value = 262; }
+      if (b.dataset.sun === 'morning') { el.value = 6; az.value = 92; } else { el.value = 8; az.value = 262; }
       sunChange();
     };
   });
@@ -92,13 +102,15 @@ export function createUI(h) {
   $('expVal').textContent = '+0.00 EV';
 
   $('panelToggle').onclick = () => $('panel').classList.toggle('collapsed');
+  // phones / narrow windows: start with the control panel folded away
+  if (window.matchMedia('(max-width: 820px), (max-height: 520px)').matches) $('panel').classList.add('collapsed');
   $('restart').onclick = () => h.onRestart();
   $('play').onclick = () => h.onPlay();
   $('sound').onclick = () => h.onSound();
 
   // timeline marks
   const tl = $('timeline');
-  const pct = (t) => ((t - T_START) / (T_END - T_START)) * 100;
+  const pct = (t) => Math.max(0, Math.min(100, axis(t)));
   const marks = TIMELINE.map((m) => {
     const d = document.createElement('div');
     d.className = 'mark';
@@ -112,7 +124,7 @@ export function createUI(h) {
   tl.addEventListener('click', (e) => {
     if (e.target !== tl && !e.target.classList.contains('progress')) return;
     const r = tl.getBoundingClientRect();
-    h.onSeek(T_START + ((e.clientX - r.left) / r.width) * (T_END - T_START));
+    h.onSeek(axisInv(((e.clientX - r.left) / r.width) * 100));
   });
 
   // engine maps
@@ -178,6 +190,9 @@ export function createUI(h) {
   ui.setPaused = (p) => { $('play').textContent = p ? '▶' : '❚❚'; };
   ui.setSound = (on) => { $('sound').textContent = on ? '🔊' : '🔇'; };
   ui.setFps = (f) => { $('fps').textContent = `${f.toFixed(0)} fps`; };
+  let lastWarp = -1;
+  ui.setWarp = (w) => { const r = Math.round(w); if (r === lastWarp) return; lastWarp = r; $('warp').textContent = r > 1 ? `AUTO ${r}×` : ''; };
+  $('autoWarp').onchange = (e) => h.onAutoWarp(e.target.checked);
   ui.hideIntro = () => $('intro').classList.add('gone');
   ui.ready = (cb) => {
     $('loading').textContent = 'Ready. Countdown starts at T−20 s.';

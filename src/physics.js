@@ -14,9 +14,9 @@ export const MU = 3.986004418e14;
 export const RE = 6371000;
 const P0 = 101325;
 const LAT = 25.997 * Math.PI / 180;           // Starbase latitude
-export const LAUNCH_AZIMUTH = 95 * Math.PI / 180; // just south of due east
+export const LAUNCH_AZIMUTH = 109 * Math.PI / 180; // south-east over the Gulf for a ~32 deg orbit (Flight 14)
 // Effective rotation rate of the launch plane (surface speed along azimuth).
-const OMEGA = (7.2921159e-5 * RE * Math.cos(LAT) * Math.sin(LAUNCH_AZIMUTH)) / RE;
+export const OMEGA = (7.2921159e-5 * RE * Math.cos(LAT) * Math.sin(LAUNCH_AZIMUTH)) / RE;
 
 // ---------------------------------------------------------------- atmosphere
 const LAYERS = [
@@ -65,8 +65,8 @@ function cdMach(M) {
 }
 
 // ------------------------------------------------------------------ engines
-export const RAPTOR_SL = { name: 'Raptor', Fsl: 2.30e6, Fvac: 2.45e6, IspVac: 350, minThrottle: 0.4, exitD: 1.3 };
-export const RAPTOR_VAC = { name: 'Raptor Vacuum', Fsl: 1.35e6, Fvac: 2.58e6, IspVac: 378, minThrottle: 0.4, exitD: 2.3 };
+export const RAPTOR_SL = { name: 'Raptor 3', Fsl: 2.75e6, Fvac: 2.94e6, IspVac: 350, minThrottle: 0.4, exitD: 1.3 };
+export const RAPTOR_VAC = { name: 'Raptor 3 Vacuum', Fsl: 1.6e6, Fvac: 3.0e6, IspVac: 380, minThrottle: 0.4, exitD: 2.3 };
 for (const e of [RAPTOR_SL, RAPTOR_VAC]) {
   e.Ae = (e.Fvac - e.Fsl) / P0; // effective exit area (pressure thrust loss)
   e.mdot = e.Fvac / (e.IspVac * G0);
@@ -127,6 +127,7 @@ class Stage {
     this.slewRate = 6 * Math.PI / 180;
     this.phase = 'pad';
     this.active = true;
+    this.heat = 0;
     this.maxQ = 0;
     this.telemetry = { h: 0, v: 0, vInertial: 0, mach: 0, q: 0, accel: 0, pa: P0, downrange: 0, vVert: 0, vHoriz: 0 };
   }
@@ -146,8 +147,8 @@ export class FlightSim {
 
   reset() {
     this.t = -20;                 // mission elapsed time (T-20 s)
-    this.booster = new Stage('Super Heavy', 205000, 3600000, 71, boosterEngines());
-    this.ship = new Stage('Starship', 125000, 1500000, 52, shipEngines());
+    this.booster = new Stage('Super Heavy', 230000, 4000000, 71, boosterEngines());
+    this.ship = new Stage('Starship', 170000, 1600000, 52, shipEngines()); // dry + 26 Starlink V3
     this.stacked = true;
     this.released = false;
     this.events = [];
@@ -161,7 +162,9 @@ export class FlightSim {
     }
     this.ship.Y = RE + 71; // ship sits on top of the booster
     this.boosterTarget = 7500;
-    this.kickDeg ??= 4.5; // splashdown point, metres downrange (offshore)
+    this.kickDeg ??= 8;
+    this.deorbitT = 2 * 3600 + 12 * 60 + 18; // Flight 14: T+2:12:18
+    this.deorbitPerigee = 70000; // splashdown point, metres downrange (offshore)
     this.updateTelemetry(this.booster);
     this.updateTelemetry(this.ship);
   }
@@ -236,7 +239,7 @@ export class FlightSim {
     if (t > 44 && t < 90) thr = 0.68 + 0.32 * (Math.abs(t - 67) / 23) ** 3;
     // limit axial acceleration late in the burn (~3.3 g)
     const mTot = B.mass() + this.ship.mass();
-    if (t > 88) thr = Math.min(1, Math.max(0.55, (2.4 * G0 * mTot) / (33 * RAPTOR_SL.Fvac)));
+    if (t > 88) thr = Math.min(1, Math.max(0.55, (3.0 * G0 * mTot) / (33 * RAPTOR_SL.Fvac)));
     if (t > 40 && !this.flags['Throttle down for max-Q']) this.event('Throttle down for max-Q');
     if (this.released) for (const e of B.engines) if (e.cmd > 0) e.cmd = thr;
 
@@ -256,7 +259,7 @@ export class FlightSim {
     if (t > 60 && B.telemetry.q < B.maxQ * 0.98 && !this.flags['Max-Q']) this.event('Max-Q');
 
     // MECO when the booster reaches its landing propellant reserve
-    if (B.prop <= 360000) this.hotStage();
+    if (B.prop <= 400000) this.hotStage();
   }
 
   hotStage() {
@@ -286,13 +289,14 @@ export class FlightSim {
       B.alphaCmd = phi - 90 * Math.PI / 180; // nose pointing back towards the launch site
       if (Math.abs(B.alpha - B.alphaCmd) < 0.12) {
         B.phase = 'boostback'; this.event('Boostback burn');
-        B.command((e) => e.ring <= 1, 1.0, (e) => (e.ring === 0 ? 0 : 0.5 + (e.index % 5) * 0.08));
+        // Raptor 3 boosters relight nearly every engine for boostback (31 of 33 on Flight 14)
+        B.command((e) => e.index !== 17 && e.index !== 29, 1.0, (e) => (e.ring === 0 ? 0 : e.ring === 1 ? 0.3 : 0.6) + (e.index % 5) * 0.06);
       }
     }
     if (B.phase === 'boostback') {
       B.alphaCmd = phi - 90 * Math.PI / 180;
       const impact = this.predictImpact(B);
-      if (impact < this.boosterTarget + 2500) for (const e of B.engines) if (e.ring === 1) e.cmd = 0.5;
+      if (impact < this.boosterTarget + 6000) for (const e of B.engines) if (e.ring === 2) e.cmd = 0;
       if (impact <= this.boosterTarget || B.prop < 60000) {
         B.command(() => true, 0); B.phase = 'coast'; this.event('Boostback shutdown');
       }
@@ -304,10 +308,11 @@ export class FlightSim {
       B.slewRate = 4 * Math.PI / 180;
       // landing burn ignition: stopping distance with 13 engines at ~70%
       const vy = B.telemetry.vVert;
-      const a13 = (13 * RAPTOR_SL.Fsl * 0.7) / B.mass() - G0 + (0.5 * B.telemetry.rho * vy * vy * 1.2 * B.area) / B.mass();
+      const a13 = (11 * RAPTOR_SL.Fsl * 0.7) / B.mass() - G0 + (0.5 * B.telemetry.rho * vy * vy * 1.2 * B.area) / B.mass();
       if (h < 4000 && vy < 0 && (vy * vy) / (2 * a13 * 0.6) > h - 400) {
         B.phase = 'landing'; this.event('Landing burn');
-        B.command((e) => e.ring <= 1, 0.7, (e) => (e.ring === 0 ? 0 : 0.15 + (e.index % 4) * 0.05));
+        // 11 of the 13 steerable engines relight, then 5, then the centre 3
+        B.command((e) => e.ring <= 1 && e.index !== 5 && e.index !== 9, 0.7, (e) => (e.ring === 0 ? 0 : 0.15 + (e.index % 4) * 0.05));
         this.landingT = this.t;
       }
     }
@@ -320,6 +325,7 @@ export class FlightSim {
       B.slewRate = 8 * Math.PI / 180;
       const a3 = (3 * RAPTOR_SL.Fsl) / B.mass() - G0;
       const vt = -Math.sqrt(2 * 0.5 * a3 * Math.max(h - 1, 0)) - 1.5; // 3-engine descent profile
+      if (vy > vt * 0.8) for (const e of B.engines) if (e.ring === 1 && e.index % 5 !== 0) e.cmd = 0;
       if (vy > vt * 0.97) for (const e of B.engines) if (e.ring === 1) e.cmd = 0;
       const lit = B.engines.filter((e) => e.cmd > 0);
       const n = lit.length || 1;
@@ -337,30 +343,140 @@ export class FlightSim {
 
   guideShip(dt) {
     const S = this.ship;
-    if (!S.active || S.phase === 'coast') return;
+    if (!S.active) return;
     const phi = Math.atan2(S.X, S.Y);
     const r = Math.hypot(S.X, S.Y);
     const h = r - RE;
     const vRad = (S.VX * S.X + S.VY * S.Y) / r;
     const vTan = (S.VX * S.Y - S.VY * S.X) / r;
-    const vIn = Math.hypot(S.VX, S.VY);
-    const thrust = S.engines.reduce((a, e) => a + e.thrust(S.telemetry.pa), 0);
-    const aT = thrust / S.mass();
-    if (aT > 1) {
-      // Fly towards a 150 km trajectory with a shaped vertical-velocity profile
-      const hT = 150000;
-      const vyT = Math.max(-150, Math.min(900, (hT - h) / 70));
-      const g = MU / (r * r) - (vTan * vTan) / r;
-      const aR = (vyT - vRad) / 25 + g;
-      const s = Math.max(-0.4, Math.min(0.95, aR / aT));
-      const gamma = Math.asin(s);
-      S.alphaCmd = phi + (Math.PI / 2 - gamma);
-      if (this.t - this.stageTime < 6) S.alphaCmd = S.alpha; // hold attitude while clearing the booster
+    const vr = this.airVel(S);
+    const vAir = Math.hypot(vr.x, vr.y);
+    const gv = Math.atan2(vr.x, vr.y); // direction of the air-relative velocity
+
+    if (S.phase === 'ascent') {
+      const thrust = S.engines.reduce((a, e) => a + e.thrust(S.telemetry.pa), 0);
+      const aT = thrust / S.mass();
+      if (aT > 1) {
+        // Fly towards a 150 km trajectory with a shaped vertical-velocity profile
+        const hT = this.shipTargetAlt ?? 250000;
+        const vyT = Math.max(-150, Math.min(this.shipVyMax ?? 300, (hT - h) / (this.shipTau ?? 500)));
+        const g = MU / (r * r) - (vTan * vTan) / r;
+        const aR = (vyT - vRad) / 25 + g;
+        const sn = Math.max(-0.4, Math.min(0.95, aR / aT));
+        S.alphaCmd = phi + (Math.PI / 2 - Math.asin(sn));
+        if (this.t - this.stageTime < 6) S.alphaCmd = S.alpha; // hold attitude while clearing the booster
+      }
+      // SECO on a "passively safe" suborbital trajectory (perigee inside the atmosphere,
+      // apogee ~275 km), then an orbit-insertion burn at apogee (Flight 14 profile)
+      if ((this.perigee(S) - RE > -50000 || S.prop < 60000) && this.t - this.stageTime > 20) {
+        S.command(() => true, 0); S.phase = 'coast'; this.event('SECO');
+        this.secoT = this.t;
+      }
+      return;
     }
-    // ~7.3 km/s surface-relative on a suborbital trajectory (like flight tests)
-    if ((vIn > 7650 || S.prop < 5000) && this.t - this.stageTime > 20) {
-      S.command(() => true, 0); S.phase = 'coast'; this.event('SECO');
+    if (S.phase === 'coast' && !this.flags['Orbit insertion'] && vRad < 0 && this.t - this.secoT > 60) {
+      // at apogee: relight one sea-level Raptor prograde to raise perigee
+      S.phase = 'insertion'; this.event('Orbit insertion burn');
+      S.command((e) => e.index === 0, 1.0);
+      this.flags['Orbit insertion'] = true;
     }
+    if (S.phase === 'insertion') {
+      S.slewRate = 4 * Math.PI / 180;
+      S.alphaCmd = Math.atan2(S.VX, S.VY); // prograde (inertial)
+      if (this.perigee(S) - RE > 258000) { S.command(() => true, 0); S.phase = 'orbit'; this.event('Orbit achieved'); this.orbitT = this.t; }
+      return;
+    }
+    if (S.phase === 'orbit') {
+      // payload bay: Starlink V3 deployment, then the first-ever Starship deorbit burn
+      if (this.t > 34 * 60 + 7 && !this.flags['Starlink deploy']) this.event('Starlink deploy');
+      if (this.t > this.deorbitT) {
+        S.phase = 'deorbit'; this.event('Deorbit burn');
+        S.command((e) => e.index === 0, 1.0);
+      }
+      // hold prograde, then swing to retrograde a few minutes ahead of the deorbit burn
+      S.slewRate = 1 * Math.PI / 180;
+      S.alphaCmd = this.t > this.deorbitT - 300 ? Math.atan2(-S.VX, -S.VY) : Math.atan2(S.VX, S.VY);
+      return;
+    }
+    if (S.phase === 'deorbit') {
+      S.slewRate = 4 * Math.PI / 180;
+      S.alphaCmd = Math.atan2(-S.VX, -S.VY); // retrograde
+      if (this.perigee(S) - RE < this.deorbitPerigee) { S.command(() => true, 0); S.phase = 'coast'; this.event('Deorbit complete'); }
+      return;
+    }
+    if (S.phase === 'coast') {
+      // before orbit insertion hold prograde; after the deorbit burn reorient belly-first
+      // for entry, nose ~55° above the velocity vector
+      S.slewRate = 1.5 * Math.PI / 180;
+      S.alphaCmd = this.flags['Deorbit complete'] ? gv - 55 * Math.PI / 180 : Math.atan2(S.VX, S.VY);
+      if (h < 122000 && vRad < 0 && this.flags['Deorbit complete']) { S.phase = 'entry'; this.event('Atmospheric entry'); }
+      return;
+    }
+    if (S.phase === 'entry') {
+      S.slewRate = 3 * Math.PI / 180;
+      const M = S.telemetry.mach;
+      // high angle of attack, increasing as the ship slows (belly-flop at subsonic speed)
+      const aoa = M > 4 ? 55 : 55 + (4 - M) / 4 * 30;
+      S.alphaCmd = gv - aoa * Math.PI / 180;
+      if (S.heat > 0.95 && !this.flags['Peak heating']) this.event('Peak heating');
+      if (M < 0.9) { S.phase = 'bellyflop'; this.event('Subsonic belly-flop'); }
+      return;
+    }
+    if (S.phase === 'bellyflop') {
+      S.slewRate = 5 * Math.PI / 180;
+      S.alphaCmd = gv - 88 * Math.PI / 180;
+      if (h < 1700) {
+        // relight the three sea-level Raptors and swing vertical (the "flip")
+        S.phase = 'flip'; this.event('Flip & landing burn');
+        S.command((e) => e.ring === 0, 0.4, (e) => 0.1 * e.index);
+        S.slewRate = 40 * Math.PI / 180;
+        this.shipFlipT = this.t;
+      }
+      return;
+    }
+    if (S.phase === 'flip' || S.phase === 'landing') {
+      const vy = S.telemetry.vVert, vh = S.telemetry.vHoriz;
+      const lean = Math.max(-0.3, Math.min(0.3, (-vh / Math.max(15, -vy)) * 0.9));
+      S.alphaCmd = phi + (h > 25 ? lean : 0);
+      if (S.phase === 'flip') {
+        // engines at minimum throttle until the thrust vector is roughly vertical
+        for (const e of S.engines) if (e.ring === 0) e.cmd = Math.abs(S.alpha - S.alphaCmd) < 0.9 ? 0.6 : 0.4;
+        if (Math.abs(S.alpha - S.alphaCmd) < 0.15) S.phase = 'landing';
+      }
+      if (S.phase === 'landing') {
+        S.slewRate = 10 * Math.PI / 180;
+        const a3 = (3 * RAPTOR_SL.Fsl) / S.mass() - G0;
+        const vt = -Math.sqrt(2 * 0.45 * a3 * Math.max(h - 1, 0)) - 1.2;
+        const need = G0 + 0.45 * a3 + (vt - vy) * 2.5;
+        const thr = Math.min(1, Math.max(0.4, (need * S.mass()) / (3 * RAPTOR_SL.Fsl * Math.max(0.5, Math.cos(S.alpha - phi)))));
+        for (const e of S.engines) if (e.ring === 0) e.cmd = thr;
+      }
+      if (h < 1.0) {
+        S.active = false; S.phase = 'splashdown'; this.event('Ship splashdown');
+        for (const e of S.engines) { e.level = 0; e.cmd = 0; }
+        this.shipLanded = { t: this.t, v: Math.hypot(vy, vh) };
+      }
+    }
+  }
+
+  apogee(s) {
+    const r = Math.hypot(s.X, s.Y), v2 = s.VX * s.VX + s.VY * s.VY;
+    const E = v2 / 2 - MU / r;
+    if (E >= 0) return Infinity;
+    const a = -MU / (2 * E);
+    const hA = s.X * s.VY - s.Y * s.VX;
+    const e = Math.sqrt(Math.max(0, 1 + (2 * E * hA * hA) / (MU * MU)));
+    return a * (1 + e);
+  }
+
+  perigee(s) {
+    const r = Math.hypot(s.X, s.Y), v2 = s.VX * s.VX + s.VY * s.VY;
+    const E = v2 / 2 - MU / r;
+    if (E >= 0) return Infinity;
+    const a = -MU / (2 * E);
+    const hA = s.X * s.VY - s.Y * s.VX;
+    const e = Math.sqrt(Math.max(0, 1 + (2 * E * hA * hA) / (MU * MU)));
+    return a * (1 - e);
   }
 
   airVel(s) { return { x: s.VX - OMEGA * s.Y, y: s.VY + OMEGA * s.X }; }
@@ -409,13 +525,33 @@ export class FlightSim {
     // angle of attack increases drag (booster falling sideways/engines-first)
     let aoa = 0;
     if (vrm > 1) aoa = Math.acos(Math.max(-1, Math.min(1, (Math.sin(s.alpha) * vr.x + Math.cos(s.alpha) * vr.y) / vrm)));
-    const cd = cdMach(mach) * (1 + 2.5 * Math.sin(aoa) ** 2) + (s === this.booster && !this.stacked ? 0.9 : 0);
-    const D = q * cd * s.area;
-
     const g = MU / (r * r * r);
     let ax = (F * Math.sin(s.alpha)) / mass - g * s.X;
     let ay = (F * Math.cos(s.alpha)) / mass - g * s.Y;
-    if (vrm > 0.01) { ax -= (D * vr.x) / (vrm * mass); ay -= (D * vr.y) / (vrm * mass); }
+    const lifting = s === this.ship && ['coast', 'insertion', 'orbit', 'deorbit', 'entry', 'bellyflop'].includes(s.phase);
+    if (lifting && vrm > 0.01) {
+      // Newtonian lifting-body model on the ship's 50 m x 9 m planform (belly-first entry)
+      const Ap = 430;
+      const sa = Math.sin(aoa), ca = Math.cos(aoa);
+      const CN = 1.3 * sa * sa;
+      const Dm = q * (Ap * CN * sa + s.area * 0.12 * ca * ca);
+      const Lm = q * Ap * CN * ca * 0.6;
+      const ux = vr.x / vrm, uy = vr.y / vrm;
+      // lift acts toward the side the nose points to, perpendicular to the flow
+      let nx = Math.sin(s.alpha) - (Math.sin(s.alpha) * ux + Math.cos(s.alpha) * uy) * ux;
+      let ny = Math.cos(s.alpha) - (Math.sin(s.alpha) * ux + Math.cos(s.alpha) * uy) * uy;
+      const nl = Math.hypot(nx, ny) || 1;
+      nx /= nl; ny /= nl;
+      ax += (-Dm * ux + Lm * nx) / mass;
+      ay += (-Dm * uy + Lm * ny) / mass;
+      // stagnation heating ~ sqrt(rho) v^3 (Sutton-Graves), normalised to ~1 at peak
+      s.heat = Math.min(1.6, 118 * Math.sqrt(atm.rho / 1.225) * Math.pow(vrm / 7500, 3));
+    } else {
+      const cd = cdMach(mach) * (1 + 2.5 * Math.sin(aoa) ** 2) + (s === this.booster && !this.stacked ? 0.9 : 0);
+      const D = q * cd * s.area;
+      if (vrm > 0.01) { ax -= (D * vr.x) / (vrm * mass); ay -= (D * vr.y) / (vrm * mass); }
+      if (s === this.ship) s.heat = Math.min(1.6, 118 * Math.sqrt(atm.rho / 1.225) * Math.pow(vrm / 7500, 3)) * (s.phase === 'ascent' ? 0 : 1);
+    }
     s.VX += ax * dt; s.VY += ay * dt;
     s.X += s.VX * dt; s.Y += s.VY * dt;
     s.prop = Math.max(0, s.prop - mdot * dt);

@@ -17,6 +17,7 @@ button.active { background: rgba(255, 255, 255, 0.92); color: #0b0c0e; border-co
 #ui.hidden { opacity: 0; }
 #ui > * { pointer-events: auto; }
 #ui > #events, #ui > .brand { pointer-events: none; }
+.brand .gh { pointer-events: auto; }
 
 .brand { position: absolute; left: max(22px, env(safe-area-inset-left)); top: max(18px, env(safe-area-inset-top)); text-shadow: 0 1px 8px rgba(0, 0, 0, 0.5); }
 .brand-title { font-size: 22px; letter-spacing: 0.42em; font-weight: 600; }
@@ -92,3 +93,12 @@ button.active { background: rgba(255, 255, 255, 0.92); color: #0b0c0e; border-co
   .clock { order: -1; flex-basis: 100%; }
   .stage-name { display: none; }
 }
+
+.gh { display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; padding: 4px 8px 4px 6px; font-size: 9px; letter-spacing: 0.24em; color: var(--dim); text-decoration: none; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 3px; background: rgba(10, 12, 16, 0.18); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); transition: color 0.2s, border-color 0.2s, background 0.2s; }
+.gh svg { width: 12px; height: 12px; opacity: 0.8; }
+.gh .gh-star { padding-left: 6px; border-left: 1px solid rgba(255, 255, 255, 0.14); }
+.gh:hover { color: #fff; border-color: rgba(255, 255, 255, 0.4); background: rgba(10, 12, 16, 0.35); }
+.intro-gh { margin-top: 18px; font-size: 11px; letter-spacing: 0.08em; }
+.intro-gh a { color: var(--dim); text-decoration: none; border-bottom: 1px solid rgba(255, 255, 255, 0.2); }
+.intro-gh a:hover { color: #fff; }
+.clock .warp { font-size: 9px; letter-spacing: 0.3em; color: var(--dim); min-height: 11px; margin-top: 2px; }

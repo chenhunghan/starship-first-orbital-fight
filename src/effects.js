@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { KIND } from './particles.js';
 import { MOUNT_HEIGHT } from './pad.js';
+import { insideVolume } from './smoke.js';
 
 // Converts the flight state into particle emission: exhaust + deluge steam at the
 // pad, the deluge water spray, cryogenic venting and frost vapour on the booster,
@@ -17,7 +18,8 @@ export class Effects {
   }
 
   rate(name, perSecond, dt) {
-    const a = (this.acc[name] || 0) + perSecond * dt;
+    if (!(perSecond > 0) || !(dt > 0)) return 0;
+    const a = Math.min((this.acc[name] || 0) + perSecond * dt, 1500); // never flood the pool
     const n = Math.floor(a);
     this.acc[name] = a - n;
     return n;
@@ -41,18 +43,19 @@ export class Effects {
     for (let i = 0; i < n; i++) {
       const ang = r() * Math.PI * 2;
       const hot = r() < 0.55;
-      const up = r() < 0.42;
+      const up = r() < 0.12;
       const sp = (60 + r() * 150) * Math.sqrt(thrust) * (0.35 + 0.65 * ground);
       const rad = 5 + r() * 9;
       const cx = s.boosterPos.x, cz = s.boosterPos.z;
       ps.emit(cx + Math.cos(ang) * rad, 2 + r() * 7, cz + Math.sin(ang) * rad,
-        Math.cos(ang) * sp * (up ? 0.4 : 1), up ? 25 + r() * 45 : 2 + r() * 12, Math.sin(ang) * sp * (up ? 0.4 : 1), {
+        Math.cos(ang) * sp * (up ? 0.5 : 1), up ? 10 + r() * 18 : 1 + r() * 6, Math.sin(ang) * sp * (up ? 0.5 : 1), {
           life: 55 + r() * 110,
           r0: 4 + r() * 4,
           r1: 20 + r() * 32 + (up ? 10 : 0),
           growT: 5 + r() * 7,
           hot: hot ? 1300 + r() * 500 : 350,
-          warm: 90 + r() * 90,
+          heatT: 0.9 + r() * 1.2,
+          warm: 70 + r() * 80,
           dens: 0.8 + r() * 0.2,
           tint: r() < 0.2 ? r() * 0.2 : 0,
           spin: 0.25,
@@ -61,7 +64,7 @@ export class Effects {
     }
 
     // ------------------------------------------------ deluge water spray
-    const spray = sim.deluge * (1 - thrust * 0.7);
+    const spray = sim.deluge * Math.max(0, 1 - thrust * 3);
     n = this.rate('spray', 260 * spray * (s.quality ?? 1), dt);
     for (let i = 0; i < n; i++) {
       const ang = r() * Math.PI * 2, rad = Math.sqrt(r()) * 13;
@@ -77,7 +80,8 @@ export class Effects {
     }
 
     // ------------------------------------------------ cryogenic vents & frost vapour
-    if (B.active && s.boosterPos.y < 20000) {
+    const hB = B.telemetry.h;
+    if (B.active && hB < 20000) {
       const speed = s.boosterVel.length();
       const onPad = !sim.released;
       const vRate = onPad ? 22 : 0;
@@ -90,7 +94,7 @@ export class Effects {
         ps.emit(_v.x, _v.y, _v.z, Math.cos(ang) * 4, 0.3, Math.sin(ang) * 4, { life: 3 + r() * 2, r0: 0.5, r1: 3.2, growT: 1.5, warm: -25, dens: 0.3, kind: KIND.VAPOR, erode: 0.2 });
       }
       // cold vapour sheet flowing down the frosted booster (denser than air)
-      const frostRate = onPad ? 36 : speed < 300 && s.boosterPos.y < 4000 ? 60 * Math.exp(-s.boosterPos.y / 2000) : 0;
+      const frostRate = onPad ? 36 : speed < 300 && hB < 4000 && sim.stacked ? 60 * Math.exp(-hB / 2000) : 0;
       n = this.rate('frost', frostRate * (s.quality ?? 1), dt);
       for (let i = 0; i < n; i++) {
         const ang = r() * Math.PI * 2;
@@ -118,18 +122,39 @@ export class Effects {
       }
     }
 
-    // ------------------------------------------------ faint exhaust / condensation trail
+    // ------------------------------------------------ exhaust entrained along the plume column
+    // (flame -> glowing gas -> steam gradient while the booster is still low)
+    const bp = s.boosterPlume;
+    if (bp && bp.axis.visible && nearPad && hAbove < 300) {
+      n = this.rate('column', 170 * thrust * Math.exp(-hAbove / 160) * (s.quality ?? 1), dt);
+      const reach = Math.max(4, s.boosterPos.y - 1);
+      for (let i = 0; i < n; i++) {
+        const f = 1 - Math.pow(r(), 3) * 0.25; // mostly at the bottom where the plume hits the plate
+        _v.copy(bp.axis.origin).addScaledVector(bp.axis.dir, reach * f);
+        const ang = r() * Math.PI * 2, rad = 3 + r() * 5 + f * 6;
+        ps.emit(_v.x + Math.cos(ang) * rad, Math.max(2, _v.y), _v.z + Math.sin(ang) * rad,
+          Math.cos(ang) * (40 + r() * 70), -(10 + r() * 20) * (1 - f), Math.sin(ang) * (40 + r() * 70), {
+            life: 25 + r() * 40, r0: 4, r1: 16 + r() * 14, growT: 5, hot: 1500 + r() * 400, heatT: 0.7 + r() * 0.8,
+            warm: 80 + r() * 60, dens: 0.55, kind: KIND.SMOKE, spin: 0.3,
+          });
+      }
+    }
+
+    // ------------------------------------------------ plume tail cooling into a faint exhaust trail
     for (const [pl, pos, vel, lev, key] of [[s.boosterPlume, s.boosterPos, s.boosterVel, thrust, 'trailB'], [s.shipPlume, s.shipPos, s.shipVel, s.shipThrust, 'trailS']]) {
       if (!pl || lev < 0.05 || !pl.axis.visible) continue;
-      const alt = pos.y;
-      if (alt < 900 || alt > 20000) continue;
-      n = this.rate(key, 30 * lev * (s.quality ?? 1), dt);
+      const alt = pl === s.boosterPlume ? B.telemetry.h : sim.ship.telemetry.h;
+      if (alt < 140 || alt > 14000) continue;
+      n = this.rate(key, 48 * lev * (s.quality ?? 1), dt);
       for (let i = 0; i < n; i++) {
-        const f = 0.35 + r() * 0.5;
+        const f = 0.45 + r() * 0.6;
         _v.copy(pl.axis.origin).addScaledVector(pl.axis.dir, pl.axis.length * f);
-        const hum = Math.exp(-alt / 3500) + (alt > 8000 ? 0.5 : 0); // contrail forms again in the cold upper troposphere
-        ps.emit(_v.x + (r() - 0.5) * 8, _v.y, _v.z + (r() - 0.5) * 8, vel.x * 0.12, vel.y * 0.12, vel.z * 0.12, {
-          life: 30 + r() * 30, r0: 9, r1: 38 + r() * 20, growT: 12, warm: 8, dens: 0.012 * hum + 0.004, tint: 0.05, kind: KIND.TRAIL,
+        const inVol = insideVolume(_v.x, _v.y, _v.z, 40);
+        const d = 0.22 * Math.exp(-alt / 1200) + 0.035;
+        const rr = pl.axis.radius * 0.7;
+        ps.emit(_v.x + (r() - 0.5) * rr, _v.y, _v.z + (r() - 0.5) * rr, vel.x * 0.1, vel.y * 0.1, vel.z * 0.1, {
+          life: 30 + r() * 30, r0: Math.max(5, rr * 0.8), r1: 30 + r() * 25, growT: 10, hot: 750 + r() * 250, heatT: 1.2,
+          warm: 10, dens: d, tint: 0.04, kind: inVol ? KIND.SMOKE : KIND.TRAIL,
         });
       }
     }
@@ -153,7 +178,7 @@ export class Effects {
 
     // ------------------------------------------------ booster landing burn over the Gulf
     if (B.phase === 'landing' && B.active) {
-      const h = s.boosterPos.y;
+      const h = B.telemetry.h;
       const g = Math.exp(-h / 60) * thrust * 3;
       n = this.rate('splash', 260 * Math.min(1, g), dt);
       for (let i = 0; i < n; i++) {

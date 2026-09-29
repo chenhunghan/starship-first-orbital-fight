@@ -26,7 +26,7 @@ export class ParticleSystem {
     this.age = f(); this.life = f(); this.r0 = f(); this.r1 = f(); this.gt = f(); this.size = f();
     this.hot = f(); this.warm = f(); this.dens = f(); this.seed = f(); this.rot = f(); this.rotV = f();
     this.sunT = f(); this.ao = f(); this.flameT = f(); this.tint = f(); this.op = f(); this.erode = f(); this.er0 = f();
-    this.drag = f(); this.grav = f();
+    this.drag = f(); this.grav = f(); this.heatT = f();
     this.kind = new Uint8Array(max);
     this.count = 0;
     this.rand = rng(99);
@@ -61,6 +61,7 @@ export class ParticleSystem {
     this.erode[i] = this.er0[i] = o.erode ?? 0.05;
     this.drag[i] = o.drag ?? 1;
     this.grav[i] = o.grav ?? 0;
+    this.heatT[i] = o.heatT ?? 1.2;
     this.kind[i] = o.kind ?? KIND.SMOKE;
     return i;
   }
@@ -70,7 +71,7 @@ export class ParticleSystem {
     if (i === j) return;
     const c3 = (a) => { a[i * 3] = a[j * 3]; a[i * 3 + 1] = a[j * 3 + 1]; a[i * 3 + 2] = a[j * 3 + 2]; };
     c3(this.p); c3(this.v);
-    for (const a of [this.age, this.life, this.r0, this.r1, this.gt, this.size, this.hot, this.warm, this.dens, this.seed, this.rot, this.rotV, this.sunT, this.ao, this.flameT, this.tint, this.op, this.erode, this.er0, this.drag, this.grav, this.kind]) a[i] = a[j];
+    for (const a of [this.age, this.life, this.r0, this.r1, this.gt, this.size, this.hot, this.warm, this.dens, this.seed, this.rot, this.rotV, this.sunT, this.ao, this.flameT, this.tint, this.op, this.erode, this.er0, this.drag, this.grav, this.heatT, this.kind]) a[i] = a[j];
   }
 
   // ------------------------------------------------------------- simulate
@@ -108,11 +109,20 @@ export class ParticleSystem {
       const txv = wx0 * ws + (a1 * 1.0 + a2 * 0.55) * turbA;
       const tyv = (b1 * 0.55 + b2 * 0.4) * turbA * 0.8;
       const tzv = wz0 * ws + (c1 * 1.0 + c2 * 0.55) * turbA;
+      // the exhaust column blows steam away from the plume axis (keeps the centre open)
+      const J = this.jet;
+      if (J && J.strength > 0.01 && y < J.yTop + 10) {
+        const jx = x - J.x, jz = z - J.z;
+        const jd = Math.hypot(jx, jz) + 0.5;
+        const push = J.strength * 70 * Math.exp(-jd / 22) * dt;
+        v[i * 3] += (jx / jd) * push; v[i * 3 + 2] += (jz / jd) * push;
+      }
       // entrainment drag: fast early deceleration, then follow the air
       const kd = this.drag[i] / (0.9 + age * 0.5);
       const kk = Math.min(1, kd * dt);
       v[i * 3] += (txv - v[i * 3]) * kk;
-      v[i * 3 + 1] += (tyv - v[i * 3 + 1]) * kk + (buoy - this.grav[i] * 9.81) * dt;
+      // vertical momentum mixes more slowly: buoyant thermals keep rising (billowing columns)
+      v[i * 3 + 1] += (tyv - v[i * 3 + 1]) * kk * (buoy > 0.3 ? 0.3 : 1) + (buoy - this.grav[i] * 9.81) * dt;
       v[i * 3 + 2] += (tzv - v[i * 3 + 2]) * kk;
       p[i * 3] += v[i * 3] * dt;
       p[i * 3 + 1] += v[i * 3 + 1] * dt;
@@ -401,7 +411,7 @@ export class ParticleSystem {
       const o = (this.side[i] ? nn++ : nf++) * 4;
       A[0][o] = this.p[i * 3]; A[0][o + 1] = this.p[i * 3 + 1]; A[0][o + 2] = this.p[i * 3 + 2]; A[0][o + 3] = this.size[i];
       const kind = this.kind[i];
-      const temp = (kind === KIND.SMOKE || kind === KIND.FIRE) && this.hot[i] > 0 ? 288 + this.hot[i] * Math.exp(-this.age[i] / 0.55) : 0;
+      const temp = (kind === KIND.SMOKE || kind === KIND.FIRE || kind === KIND.TRAIL) && this.hot[i] > 0 ? 288 + this.hot[i] * Math.exp(-this.age[i] / this.heatT[i]) : 0;
       A[1][o] = this.rot[i]; A[1][o + 1] = Math.floor(this.seed[i] * 16); A[1][o + 2] = this.op[i]; A[1][o + 3] = temp;
       A[2][o] = this.sunT[i]; A[2][o + 1] = this.ao[i]; A[2][o + 2] = this.flameT[i]; A[2][o + 3] = this.tint[i];
       A[3][o] = this.erode[i]; A[3][o + 1] = kind; A[3][o + 2] = this.seed[i]; A[3][o + 3] = 0;

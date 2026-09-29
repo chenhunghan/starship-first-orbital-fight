@@ -6,6 +6,7 @@ import { patchMaterial, shared } from './shared.js';
 // Coordinates: x = east, z = south, pad at the origin. One unit = 1 m.
 
 export const SURFACE_GLSL = /* glsl */ `
+uniform float uOpen, uDeluge;
 float shoreX(float z) {
   return 640.0 + 28.0 * sin(z * 0.0009 + 0.4) + 12.0 * sin(z * 0.0031) + max(0.0, -z - 8600.0) * 0.06;
 }
@@ -45,10 +46,17 @@ Surf surface(vec2 p, float dist) {
   // pad complex (kept dry)
   float apron = boxSDF(p, vec2(10.0, -10.0), vec2(135.0, 150.0));
   float tankPad = boxSDF(p, vec2(-250.0, 110.0), vec2(95.0, 75.0));
-  float gravel = min(boxSDF(p, vec2(-90.0, 40.0), vec2(250.0, 170.0)), boxSDF(p, vec2(200.0, -20.0), vec2(120.0, 120.0))) + (n3 - 0.5) * 50.0;
+  float gravel = min(boxSDF(p, vec2(-40.0, 40.0), vec2(170.0, 130.0)), boxSDF(p, vec2(150.0, -10.0), vec2(90.0, 90.0))) + (n3 - 0.5) * 70.0 + (n2 - 0.5) * 60.0;
   float dryZone = step(gravel, 40.0);
 
-  float lw = max(max(max(pass, madre), max(southBay, river)), max(max(fgPond, nearPond), pools));
+  // meandering tidal channels threading through the flats
+  vec2 wq = p * 0.0011 + vec2(fbm2(p * 0.0007 + 11.0, 3), fbm2(p * 0.0007 + 23.0, 3)) * 1.6;
+  float ridge = abs(fbm2(wq, 5) - 0.5);
+  float chW = mix(0.012, 0.03, fbm2(p * 0.0005 + 5.0, 2));
+  float channels = smoothstep(chW, chW * 0.55, ridge) * smoothstep(-380.0, -900.0, dx) * (1.0 - step(p.y, -8000.0));
+  float ridge2 = abs(fbm2(wq * 3.1 + 7.7, 4) - 0.5);
+  channels = max(channels, smoothstep(0.012, 0.006, ridge2) * flats * 0.9);
+  float lw = max(max(max(pass, madre), max(southBay, river)), max(max(fgPond, nearPond), max(pools, channels)));
   lw *= 1.0 - dryZone;
   s.ocean = max(ocean, pass * step(-200.0, dx));
   s.water = max(lw, s.ocean);
@@ -113,9 +121,18 @@ Surf surface(vec2 p, float dist) {
   s.foam = s.ocean * smoothstep(90.0, 0.0, dx) * smoothstep(0.35, 0.9, sin((dx + uTime * 3.0) * 0.18 + n3 * 5.0) * 0.5 + 0.5 + (n4 - 0.5) * 0.6);
   s.foam += s.ocean * smoothstep(14.0, 0.0, abs(dx - swash - 8.0)) * 0.8;
   s.foam = clamp(s.foam, 0.0, 1.0);
+  // deluge water sheet spreading around the launch mount
+  float sheet = uDeluge * smoothstep(62.0 + 25.0 * n3, 30.0, rP) * smoothstep(20.0, 26.0, rP);
+  col = mix(col, vec3(0.82, 0.84, 0.85) * (0.75 + 0.3 * n4), sheet * smoothstep(0.35, 0.65, n4 + n3 * 0.4));
+  wet = max(wet, sheet);
   s.albedo = col;
   s.rough = rough;
   s.wet = wet;
+  if (uOpen > 0.5) {
+    // open ocean far from any coast (splashdown zone)
+    s.water = 1.0; s.ocean = 1.0; s.foam = 0.0; s.wet = 0.0; s.padSoot = 0.0;
+    s.albedo = vec3(0.01, 0.03, 0.045);
+  }
   return s;
 }
 `;
@@ -149,7 +166,7 @@ function terrainGeometry() {
 
 export function createTerrain() {
   const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1, metalness: 0 });
-  const uniforms = { uReflStrength: { value: 1 } };
+  const uniforms = { uReflStrength: { value: 1 }, uOpen: { value: 0 }, uDeluge: { value: 0 } };
   patchMaterial(
     mat,
     {

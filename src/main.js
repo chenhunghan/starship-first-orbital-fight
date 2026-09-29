@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { FlightSim, LAUNCH_AZIMUTH } from './physics.js';
+import { FlightSim, LAUNCH_AZIMUTH, OMEGA, RE } from './physics.js';
+import { Plasma } from './reentry.js';
 import { createSky, computeLighting, atmosParams } from './sky.js';
 import { createTerrain } from './terrain.js';
 import { createPad, MOUNT_HEIGHT } from './pad.js';
@@ -66,6 +67,8 @@ scene.add(booster.group, ship.group);
 const boosterPlume = new Plume(booster.layout, { clusterR: 4.2, gain: 1.0 });
 const shipPlume = new Plume(ship.layout, { clusterR: 3.0, gain: 0.9 });
 pscene.add(boosterPlume.group, shipPlume.group);
+const plasma = new Plasma();
+pscene.add(plasma.group);
 
 const ps = new ParticleSystem(QUALITY.high.maxParticles + 4000);
 pscene.add(ps.farMesh, ps.nearMesh);
@@ -79,13 +82,15 @@ const audio = new LaunchAudio();
 const sim = new FlightSim();
 
 // ------------------------------------------------------------------ sun
-const sunState = { el: 11, az: 102 };
+const sunState = { el: 6, az: 92 }; // Flight 14: 07:49 CDT, ~30 min after sunrise
 const sunDir = new THREE.Vector3();
+const sun0 = new THREE.Vector3(); // sun direction at the pad at T-0 (fixed in inertial space)
 let lighting = null;
 function setSun(el, az) {
   sunState.el = el; sunState.az = az;
   const e = THREE.MathUtils.degToRad(el), a = THREE.MathUtils.degToRad(az);
-  sunDir.set(Math.sin(a) * Math.cos(e), Math.sin(e), -Math.cos(a) * Math.cos(e)).normalize();
+  sun0.set(Math.sin(a) * Math.cos(e), Math.sin(e), -Math.cos(a) * Math.cos(e)).normalize();
+  localSun(sunDir);
   refreshLighting(40);
   ps.sunDir.copy(sunDir);
   ps.lightClouds(sunDir);
@@ -136,6 +141,7 @@ function updateEnvironment() {
   scene.environment = envRT.texture;
   booster.group.visible = ship.group.visible = true;
   envDirty = false;
+  envSun.copy(sunDir);
 }
 
 // ------------------------------------------------------------------ camera
@@ -190,16 +196,48 @@ const dirH = new THREE.Vector3(Math.sin(LAUNCH_AZIMUTH), 0, -Math.cos(LAUNCH_AZI
 const tiltAxis = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), dirH).normalize();
 const yawBooster = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), THREE.MathUtils.degToRad(-30));
 const yawShip = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), THREE.MathUtils.degToRad(-30));
+const yawEntry = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI - LAUNCH_AZIMUTH);
+const _yawTmp = new THREE.Quaternion();
 const pose = {
   boosterPos: new THREE.Vector3(), boosterQuat: new THREE.Quaternion(), boosterVel: new THREE.Vector3(),
   shipPos: new THREE.Vector3(), shipQuat: new THREE.Quaternion(), shipVel: new THREE.Vector3(),
 };
 const prevB = new THREE.Vector3(), prevS = new THREE.Vector3();
 let splashT = null;
+// Scene origin ("anchor") = a point on the launch great circle. It stays at the pad
+// until the tracked stage is far downrange, then hops along with it so that the
+// scene stays numerically small (orbit, re-entry, splashdown in the Indian Ocean).
+let anchorAngle = 0;
+const wrapPi = (a) => Math.atan2(Math.sin(a), Math.cos(a));
 function stagePose(tel, offsetY, outPos, outQuat, yaw) {
-  outPos.copy(dirH).multiplyScalar(tel.s);
-  outPos.y = tel.y + offsetY;
-  outQuat.setFromAxisAngle(tiltAxis, tel.tilt).multiply(yaw);
+  const d = wrapPi(tel.downrange / RE - anchorAngle);
+  const r = RE + tel.h;
+  outPos.copy(dirH).multiplyScalar(r * Math.sin(d));
+  outPos.y = r * Math.cos(d) - RE + (anchorAngle === 0 ? offsetY : 0);
+  outQuat.setFromAxisAngle(tiltAxis, tel.tilt - anchorAngle).multiply(yaw);
+}
+// local sun direction at the anchor: the Earth has turned (omega*t) and we moved (anchor)
+function localSun(out) {
+  const ang = anchorAngle + OMEGA * Math.max(0, sim.t);
+  return out.copy(sun0).applyAxisAngle(tiltAxis, -ang);
+}
+function updateAnchor() {
+  const tel = sim.stacked || followShip ? sim.ship.telemetry : sim.booster.telemetry;
+  const range = tel.downrange;
+  const angle = range / RE;
+  let a = anchorAngle;
+  if (Math.abs(range) < 250000 && anchorAngle === 0) a = 0;
+  else if (Math.abs(wrapPi(angle - anchorAngle)) * RE > 60000 || (anchorAngle === 0 && Math.abs(range) >= 250000)) a = Math.round(angle * RE / 50000) * 50000 / RE;
+  if (Math.abs(range) < 200000) a = 0;
+  if (a !== anchorAngle) {
+    anchorAngle = a;
+    const far = anchorAngle !== 0;
+    pad.visible = !far;
+    terrain.userData.uniforms.uOpen.value = far ? 1 : 0;
+    for (let i = ps.count - 1; i >= 0; i--) if (ps.kind[i] !== KIND.CLOUD) ps.kill(i);
+    return true;
+  }
+  return false;
 }
 function updatePoses(dt) {
   prevB.copy(pose.boosterPos); prevS.copy(pose.shipPos);
@@ -211,7 +249,9 @@ function updatePoses(dt) {
     pose.shipQuat.copy(pose.boosterQuat).multiply(yawBooster.clone().invert()).multiply(yawShip);
     pose.shipPos.set(0, BOOSTER_LEN, 0).applyQuaternion(pose.boosterQuat).add(pose.boosterPos);
   } else {
-    stagePose(S.telemetry, off, pose.shipPos, pose.shipQuat, yawShip);
+    // after SECO the ship rolls so its tiled belly (local +Z) faces the direction of flight
+    const k = sim.secoT !== undefined ? Math.min(1, Math.max(0, (sim.t - sim.secoT - 20) / 90)) : 0;
+    stagePose(S.telemetry, off, pose.shipPos, pose.shipQuat, _yawTmp.copy(yawShip).slerp(yawEntry, k * k * (3 - 2 * k)));
   }
   // splashdown: tip over and sink
   if (!B.active && sim.flags['Booster splashdown']) {
@@ -231,7 +271,8 @@ function updatePoses(dt) {
   booster.group.quaternion.copy(pose.boosterQuat);
   ship.group.position.copy(pose.shipPos);
   ship.group.quaternion.copy(pose.shipQuat);
-  booster.group.visible = !(splashT !== null && sim.t - splashT > 30);
+  booster.group.visible = !(splashT !== null && sim.t - splashT > 30) && (anchorAngle === 0 || Math.abs(wrapPi(B.telemetry.downrange / RE - anchorAngle)) * RE < 400000);
+  ship.group.visible = !(sim.shipLanded && sim.t - sim.shipLanded.t > 25);
 }
 
 function focusPoint() {
@@ -262,7 +303,8 @@ function seek(t) {
 
 function advance(simDt) {
   // subdivide so emission and particle integration stay stable under time warp
-  const chunk = seeking !== null ? 1 / 12 : 1 / 30;
+  // (big warps: coarser particle chunks; the flight physics always steps at 1/120 s)
+  const chunk = Math.max(seeking !== null ? 1 / 12 : 1 / 30, simDt / 24);
   let left = simDt;
   while (left > 1e-6) {
     const d = Math.min(chunk, left);
@@ -280,6 +322,30 @@ function advance(simDt) {
   }
 }
 
+// automatic time-warp through the long quiet parts of the mission (coast, orbit, entry)
+let autoWarp = true;
+function autoWarpFactor() {
+  const S = sim.ship;
+  if (sim.stacked || !S.active) return 1;
+  const ts = sim.t - (sim.secoT ?? 1e9);
+  const vRad = S.telemetry.vVert;
+  switch (S.phase) {
+    case 'coast':
+      if (!sim.flags['Orbit insertion']) return ts < 20 ? 1 : Math.abs(vRad) < 40 ? 2 : 40;
+      return S.telemetry.h > 130000 ? 40 : 6; // after the deorbit burn, heading for entry
+    case 'orbit': {
+      const toDeorbit = sim.deorbitT - sim.t;
+      if (toDeorbit < 20) return 1;
+      if (toDeorbit < 400) return 10;
+      return 60;
+    }
+    case 'insertion': case 'deorbit': return 1;
+    case 'entry': return (S.heat || 0) > 0.25 ? 4 : 12;
+    case 'bellyflop': return S.telemetry.h > 4000 ? 3 : 1;
+    default: return 1;
+  }
+}
+
 // ------------------------------------------------------------------ UI
 const ui = createUI({
   cams: CAMS,
@@ -293,6 +359,7 @@ const ui = createUI({
   onQuality: (q) => setQuality(q),
   onExposure: (ev) => { userEV = ev; },
   onFollowShip: (v) => { followShip = v; },
+  onAutoWarp: (v) => { autoWarp = v; },
   onSound: async () => {
     if (audio.enabled) audio.stop(); else await audio.start();
     ui.setSound(audio.enabled);
@@ -372,11 +439,19 @@ function renderReflection() {
 }
 
 let frameCount = 0;
+let spaceFramed = false;
+const _sunTmp = new THREE.Vector3(), envSun = new THREE.Vector3();
+let lastLightT = 0, lastEnvT = 0;
+const DBG = { refl: !params.has('norefl'), clouds: !params.has('noclouds'), smoke: !params.has('nosmoke'), part: !params.has('nopart') };
 function render(time) {
   // reflection first (sampled by the water in the main pass)
-  renderReflection();
+  if (DBG.refl) renderReflection();
   sky.mesh.position.copy(camera.position);
   sky.uniforms.uCamAlt.value = Math.max(1, camera.position.y);
+  // from high altitude the whole Earth (surface + clouds) comes from the sky shader
+  const high = camera.position.y > 45000;
+  terrain.visible = !high;
+  sky.uniforms.uPlanetOffset.value.set(anchorAngle * 900, 0, 0);
   renderer.setRenderTarget(pipeline.main);
   renderer.render(scene, camera);
 
@@ -386,14 +461,16 @@ function render(time) {
   ps.uniforms.uPartRes.value.copy(res);
   ps.uniforms.uLogFar.value = Math.log2(FAR + 1);
   boosterPlume.setDepth(pipeline.main.depthTexture, res, Math.log2(FAR + 1));
-  clouds.render(renderer, camera, pipeline.main.depthTexture);
-  smoke.render(camera, pipeline.main.depthTexture, boosterPlume.axis, ps.time);
+  if (DBG.clouds && !high) clouds.render(renderer, camera, pipeline.main.depthTexture);
+  clouds.mesh.visible = !high;
+  if (DBG.smoke) smoke.render(camera, pipeline.main.depthTexture, boosterPlume.axis, ps.time);
   shipPlume.setDepth(pipeline.main.depthTexture, res, Math.log2(FAR + 1));
+  plasma.setDepth(pipeline.main.depthTexture, res, Math.log2(FAR + 1));
   renderer.setRenderTarget(pipeline.part);
   renderer.setClearColor(0x000000, 0);
   renderer.clear();
   renderer.autoClear = false;
-  renderer.render(pscene, camera);
+  if (DBG.part) renderer.render(pscene, camera);
   renderer.autoClear = true;
 
   pipeline.params.exposure = baseExposure * Math.pow(2, userEV);
@@ -413,17 +490,27 @@ function tick(now) {
   fpsAcc += dtReal; fpsN++;
   if (fpsAcc > 0.5) { ui.setFps(fpsN / fpsAcc); fpsAcc = 0; fpsN = 0; }
 
-  let scale = paused || !started ? 0 : timeScale;
+  let scale = paused || !started ? 0 : timeScale * (autoWarp ? autoWarpFactor() : 1);
+  ui.setWarp(autoWarp && scale > timeScale * 1.01 ? scale : 0);
   if (seeking !== null) {
-    scale = Math.min(60, Math.max(4, (seeking - sim.t) * 2));
+    scale = Math.min(sim.t > 900 ? 900 : 60, Math.max(4, (seeking - sim.t) * 2));
     if (sim.t >= seeking) { seeking = null; if (params.has('pause')) { paused = true; ui.setPaused(true); } }
   }
   const simDt = dtReal * scale;
   advance(simDt);
 
+  // scene anchor follows the tracked stage far downrange; the local sun moves with
+  // Earth's rotation and our position along the ground track
+  const reAnchored = updateAnchor();
+  localSun(_sunTmp);
+  const sunMoved = _sunTmp.angleTo(sunDir) > 0.004;
+  if (sunMoved) { sunDir.copy(_sunTmp); ps.sunDir.copy(sunDir); }
   // lighting follows the vehicle altitude when the camera is up there
   const alt = Math.max(30, Math.min(camera.position.y, 150000));
-  if (Math.abs(alt - lastLightAlt) > Math.max(200, lastLightAlt * 0.15)) refreshLighting(alt);
+  // (throttled: lighting at most ~5x per second, the environment probe every few seconds)
+  if ((sunMoved || reAnchored || Math.abs(alt - lastLightAlt) > Math.max(200, lastLightAlt * 0.15)) && now - lastLightT > 200) { refreshLighting(alt); lastLightT = now; }
+  if ((reAnchored || _sunTmp.angleTo(envSun) > 0.05) && !envDirty && now - lastEnvT > 3000 && scale < 20) { envDirty = true; lastEnvT = now; }
+  terrain.userData.uniforms.uDeluge.value = anchorAngle === 0 ? sim.deluge : 0;
 
   // engines, plumes, flame light
   const bLev = sim.booster.engines.map((e) => (sim.booster.active ? e.level : 0));
@@ -434,6 +521,8 @@ function tick(now) {
   ship.group.updateMatrixWorld(true);
   boosterPlume.update(booster.group.matrixWorld, bLev, sim.booster.telemetry.pa, camera, Q.emit);
   shipPlume.update(ship.group.matrixWorld, sLev, sim.ship.telemetry.pa, camera, Q.emit);
+  plasma.update(ship.group, pose.shipVel, sim.ship.heat || 0);
+  ship.materials.tiles.userData.uniforms && (ship.materials.tiles.userData.uniforms.uHeat.value = Math.min(1, (sim.ship.heat || 0) * 1.1));
   booster.materials.ringMat.userData.shader && (booster.materials.ringMat.userData.shader.uniforms.uVentGlow.value =
     sim.flags['Hot staging'] && sim.t - (sim.stageTime ?? 0) < 4 ? Math.max(0, 1 - (sim.t - sim.stageTime) / 4) : 0);
   // frost sheds with altitude and aerodynamic heating
@@ -463,13 +552,24 @@ function tick(now) {
   shared.uFlameColor.value.set(1, 0.55, 0.26).multiplyScalar(3.2e4 * fI);
   ps.flamePos.copy(fire);
   ps.flameOn = fI;
+  ps.jet = { x: nozzle.x, z: nozzle.z, yTop: nozzle.y, strength: thrust * Math.exp(-Math.max(0, bh - MOUNT_HEIGHT) / 150) * (sim.booster.active ? 1 : 0) };
 
   // camera
   const focus = focusPoint();
-  if (cam.mode === 'chase') {
-    const d = focus.clone().sub(lastFocus);
-    camera.position.add(d);
-    controls.target.add(d);
+  // far from Starbase, ground-based cameras ride along with the vehicle instead
+  if (anchorAngle !== 0 && !spaceFramed && (cam.mode === 'track' || cam.mode === 'fixed' || cam.mode === 'chase') && sim.ship.telemetry.h > 60000) {
+    // first frame far downrange: frame the ship with the Earth below (like the webcast views)
+    spaceFramed = true;
+    const back = dirH.clone().multiplyScalar(-260);
+    camera.position.copy(focus).add(back).add(new THREE.Vector3(0, 55, 0)).addScaledVector(tiltAxis, 120);
+    controls.target.copy(focus);
+  }
+  if (anchorAngle === 0) spaceFramed = false;
+  if (cam.mode === 'chase' || (anchorAngle !== 0 && (cam.mode === 'track' || cam.mode === 'fixed'))) {
+    // keep the user's orbit offset, but lock the target onto the vehicle
+    const off = camera.position.clone().sub(controls.target);
+    controls.target.copy(focus);
+    camera.position.copy(focus).add(off);
   } else if (cam.mode === 'track') {
     trackTarget.lerp(focus, 1 - Math.exp(-dtReal * 6));
     controls.target.copy(trackTarget);
@@ -478,10 +578,10 @@ function tick(now) {
   lastFocus.copy(focus);
   if (cam.mode === 'onboard') {
     const src = sim.stacked || !followShip ? booster.group : ship.group;
-    const p = sim.stacked || !followShip ? new THREE.Vector3(3.6, 64, 3.9) : new THREE.Vector3(3.6, 30, 3.6);
+    const p = sim.stacked || !followShip ? new THREE.Vector3(3.6, 64, 3.9) : new THREE.Vector3(-3.4, 16, -3.6);
     camera.position.copy(p.applyMatrix4(src.matrixWorld));
     const look = new THREE.Vector3(0, -1, 0).transformDirection(src.matrixWorld);
-    const up = new THREE.Vector3(0.7, 0, 0.7).transformDirection(src.matrixWorld);
+    const up = (sim.stacked || !followShip ? new THREE.Vector3(0.7, 0, 0.7) : new THREE.Vector3(-0.7, 0, -0.7)).transformDirection(src.matrixWorld);
     camera.up.copy(up);
     camera.lookAt(camera.position.clone().add(look));
     camera.fov = lensFov; camera.updateProjectionMatrix();

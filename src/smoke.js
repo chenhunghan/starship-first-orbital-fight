@@ -134,8 +134,8 @@ export class SmokeVolume {
       uOrigin: { value: new THREE.Vector3(VOL.ox, VOL.oy, VOL.oz) }, uSize: { value: new THREE.Vector3(VOL.sx, VOL.sy, VOL.sz) },
       uDepth: { value: null }, uLogFar: { value: Math.log2(2e6 + 1) }, uRes: { value: new THREE.Vector2(1, 1) },
       uInvProj: { value: new THREE.Matrix4() }, uCamWorld: { value: new THREE.Matrix4() }, uCamFwd: { value: new THREE.Vector3() },
-      uSteps: { value: 96 }, uSimTime: { value: 0 },
-      uPlumeO: { value: new THREE.Vector3() }, uPlumeD: { value: new THREE.Vector3(0, -1, 0) }, uPlumeL: { value: 0 },
+      uSteps: { value: 96 }, uSimTime: { value: 0 }, uBoxMin: { value: new THREE.Vector3() }, uBoxMax: { value: new THREE.Vector3() },
+      uPlumeO: { value: new THREE.Vector3() }, uPlumeD: { value: new THREE.Vector3(0, -1, 0) }, uPlumeL: { value: 0 }, uPlumeLevel: { value: 0 },
       uWind: { value: new THREE.Vector3(-3.2, 0, -2.4) },
     };
     this.marchMain = this.makeMarch(false);
@@ -202,12 +202,12 @@ export class SmokeVolume {
         uniform sampler2D uDepth;
         uniform float uLogFar, uSimTime;
         uniform vec2 uRes;
-        uniform vec3 uOrigin, uSize, uCamFwd, uWind;
+        uniform vec3 uOrigin, uSize, uCamFwd, uWind, uBoxMin, uBoxMax;
         uniform mat4 uInvProj, uCamWorld;
         uniform int uSteps;
         uniform vec3 uSunColor, uSkyAmb, uGroundAmb, uFlamePos, uFlameColor;
         uniform vec3 uPlumeO, uPlumeD;
-        uniform float uPlumeL;
+        uniform float uPlumeL, uPlumeLevel;
         ${NOISE}
         ${AERIAL}
         vec2 box(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax) {
@@ -218,15 +218,25 @@ export class SmokeVolume {
         }
         float hg(float mu, float g) { float gg = g * g; return (1.0 - gg) / (12.566 * pow(1.0 + gg - 2.0 * g * mu, 1.5)); }
         float remap(float v, float a, float b, float c, float d) { return c + (v - a) / (b - a) * (d - c); }
-        vec3 fireColor(float k) {
-          // incandescent gas: deep orange -> yellow-white as it gets hotter
-          return mix(vec3(1.0, 0.32, 0.06), vec3(1.0, 0.78, 0.45), clamp(k * 0.5, 0.0, 1.0));
+        vec3 bbColor(float T) {
+          T = clamp(T, 800.0, 12000.0) / 100.0;
+          vec3 c;
+          c.r = T <= 66.0 ? 1.0 : clamp(1.292936 * pow(T - 60.0, -0.1332047), 0.0, 1.0);
+          c.g = T <= 66.0 ? clamp(0.3900816 * log(T) - 0.6318414, 0.0, 1.0) : clamp(1.1298909 * pow(T - 60.0, -0.0755148), 0.0, 1.0);
+          c.b = T >= 66.0 ? 1.0 : (T <= 19.0 ? 0.0 : clamp(0.5432068 * log(T - 10.0) - 1.1962541, 0.0, 1.0));
+          return pow(c, vec3(2.2));
+        }
+        // incandescent gas: heat fraction -> temperature -> blackbody colour & ~T^4 radiance
+        vec3 fireEmission(float heat) {
+          float T = 850.0 + 1700.0 * clamp(heat, 0.0, 1.4);
+          float k = T / 1800.0;
+          return bbColor(T) * k * k * k * k;
         }
         void main() {
           vec4 vp = uInvProj * vec4(vNdc, 1.0, 1.0);
           vec3 rd = normalize(mat3(uCamWorld) * normalize(vp.xyz / vp.w));
           vec3 ro = cameraPosition;
-          vec2 tb = box(ro, rd, uOrigin, uOrigin + uSize);
+          vec2 tb = box(ro, rd, uBoxMin, uBoxMax);
           tb.x = max(tb.x, 0.0);
           float tMax = tb.y;
           #ifndef REFLECTION
@@ -256,7 +266,7 @@ export class SmokeVolume {
           }
           float len = tMax - tb.x;
           float n = float(uSteps);
-          float stepL = max(len / n, 2.5);
+          float stepL = clamp(len / n, 1.8, 14.0);
           float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
           float t = tb.x + stepL * jit;
           float mu = dot(rd, uSunDir);
@@ -294,7 +304,13 @@ export class SmokeVolume {
                 // sun: single scattering + two softer multiple-scattering octaves
                 float beer = exp(-odS) + 0.5 * exp(-odS * 0.25) + 0.25 * exp(-odS * 0.06);
                 float powder = 1.0 - exp(-dens * 2.0);
-                vec3 sunL = uSunColor * beer * phase * mix(0.6, 1.0, powder) * 3.14159 * 0.9;
+                // small-scale self shadowing: compare the erosion field one step toward the sun
+                vec3 po = (p + uSunDir * 7.0 - adv) / 110.0;
+                vec4 o2 = texture(uNoise, po * 3.9 + vec3(0.31, 0.17, 0.73));
+                vec4 o3 = texture(uNoise, po * 14.0 + vec3(0.7, 0.11, 0.37));
+                float erO = billow * 0.55 + (o2.g * 0.6 + o2.b * 0.4) * 0.3 + (o3.g * 0.6 + o3.a * 0.4) * 0.15;
+                float selfSh = clamp(1.0 - (erO - er) * 6.0, 0.28, 1.25);
+                vec3 sunL = uSunColor * beer * phase * mix(0.6, 1.0, powder) * 3.14159 * 0.9 * selfSh;
                 // sky & ground ambient; shaded areas take the blue sky colour
                 float hN = clamp((p.y - uOrigin.y) / 450.0, 0.0, 1.0);
                 vec3 amb = mix(uGroundAmb * 0.9 + uSkyAmb * 1.2, uSkyAmb * 2.6, 0.3 + 0.7 * hN) * (0.3 + 0.7 * exp(-occ * 0.45)) * (0.65 + 0.35 * curl);
@@ -306,10 +322,21 @@ export class SmokeVolume {
                 vec3 S = alb * (sunL + amb + fl);
                 // incandescence of the hot exhaust core
                 float heat = v.g / max(base, 0.05);
-                S += fireColor(heat) * v.g * 55.0;
+                // flame -> smoke gradient: hot exhaust glows by its temperature and fades into steam
+                S += fireEmission(heat) * min(v.g, 1.5) * 90.0 * (0.5 + 1.0 * lobe);
                 // fire & plume impingement glowing inside the steam near the base
                 float dfl = sqrt(df2);
                 S += uFlameColor * 2.2e-4 * exp(-dfl / 26.0) * (0.5 + 0.5 * lobe);
+                // the impingement fireball: burning/ incandescent exhaust spreading under the mount
+                float fb = exp(-dfl / 20.0) * smoothstep(60.0, 5.0, p.y);
+                S += fireEmission(0.8 + 0.5 * lobe) * fb * length(uFlameColor) * 1.6e-4;
+                if (uPlumeL > 0.0) {
+                  vec3 w = p - uPlumeO;
+                  float sp = clamp(dot(w, uPlumeD), 0.0, uPlumeL);
+                  float dax = length(w - uPlumeD * sp);
+                  float g = exp(-dax / 9.0) * exp(-sp / (uPlumeL * 0.8));
+                  S += mix(vec3(1.0, 0.45, 0.16), vec3(1.0, 0.7, 0.55), exp(-sp / 25.0)) * g * uPlumeLevel * 22.0;
+                }
                 float a = 1.0 - exp(-dens * SIGMA * 1.4 * stepL);
                 vec3 c = S * a;
                 if (t < tSplit) { colF += T * c; TF *= 1.0 - a; }
@@ -318,7 +345,7 @@ export class SmokeVolume {
                 T *= 1.0 - a;
               }
             }
-            t += stepL * (base > 0.004 ? 1.0 : 2.0);
+            t += stepL * (base > 0.004 ? 1.0 : 3.0);
           }
           float aTot = 1.0 - T;
           if (aTot < 0.002) {
@@ -367,9 +394,10 @@ export class SmokeVolume {
       const op = ps.op[i];
       if (op < 0.003) continue;
       let r = ps.size[i] * 1.15;
-      let m = op * ps.dens[i] * 1.6;
+      let m = op * ps.dens[i] * 0.9;
       if (r < minR) { m *= (r / minR) ** 3; r = minR; } // conserve mass for sub-voxel puffs
-      const hot = ps.hot[i] > 0 ? Math.max(0, (ps.hot[i] * Math.exp(-ps.age[i] / 0.55) - 500) / 1300) : 0;
+      // gas temperature above ambient; the glowing core cools by mixing within ~1-2 s
+      const hot = ps.hot[i] > 0 ? Math.max(0, (ps.hot[i] * Math.exp(-ps.age[i] / (ps.heatT ? ps.heatT[i] : 1.2)) - 350) / 1400) : 0;
       P[n * 4] = x; P[n * 4 + 1] = y; P[n * 4 + 2] = z; P[n * 4 + 3] = r;
       D[n * 4] = m; D[n * 4 + 1] = m * hot; D[n * 4 + 2] = m * ps.tint[i]; D[n * 4 + 3] = ps.seed[i];
       n++;
@@ -378,10 +406,17 @@ export class SmokeVolume {
     this.aP.clearUpdateRanges(); this.aP.addUpdateRange(0, Math.max(1, n) * 4); this.aP.needsUpdate = true;
     this.aD.clearUpdateRanges(); this.aD.addUpdateRange(0, Math.max(1, n) * 4); this.aD.needsUpdate = true;
     this.count = n;
-    // bounding height of the smoke to skip empty slices
+    // tight bounds of the smoke (skip empty slices, shorten rays)
     let top = -1e9;
-    for (let k = 0; k < n; k++) top = Math.max(top, P[k * 4 + 1] + P[k * 4 + 3]);
+    const bmin = [1e9, 1e9, 1e9], bmax = [-1e9, -1e9, -1e9];
+    for (let k = 0; k < n; k++) {
+      const r = P[k * 4 + 3] * 0.9;
+      for (let a = 0; a < 3; a++) { bmin[a] = Math.min(bmin[a], P[k * 4 + a] - r); bmax[a] = Math.max(bmax[a], P[k * 4 + a] + r); }
+    }
+    top = bmax[1];
     this.top = top;
+    this.uniforms.uBoxMin.value.set(Math.max(VOL.ox, bmin[0]), Math.max(VOL.oy, bmin[1]), Math.max(VOL.oz, bmin[2]));
+    this.uniforms.uBoxMax.value.set(Math.min(VOL.ox + VOL.sx, bmax[0]), Math.min(VOL.oy + VOL.sy, bmax[1]), Math.min(VOL.oz + VOL.sz, bmax[2]));
     this.active = n > 0;
     return n;
   }
@@ -418,7 +453,7 @@ export class SmokeVolume {
     camera.getWorldDirection(u.uCamFwd.value);
     u.uSimTime.value = simTime;
     if (plumeAxis && plumeAxis.visible) {
-      u.uPlumeO.value.copy(plumeAxis.origin); u.uPlumeD.value.copy(plumeAxis.dir); u.uPlumeL.value = plumeAxis.length;
+      u.uPlumeO.value.copy(plumeAxis.origin); u.uPlumeD.value.copy(plumeAxis.dir); u.uPlumeL.value = plumeAxis.length; u.uPlumeLevel.value = plumeAxis.level ?? 1;
     } else u.uPlumeL.value = 0;
     this.marchQuad.material = this.marchMain;
     const r = this.renderer;

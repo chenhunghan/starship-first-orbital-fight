@@ -132,6 +132,7 @@ export function createSky() {
     uGroundAlbedo: { value: new THREE.Color(0.06, 0.075, 0.08) },
     uSunDisc: { value: 1.0 },
     uSteps: { value: 16 },
+    uPlanetOffset: { value: new THREE.Vector3() },
   };
   const material = new THREE.ShaderMaterial({
     uniforms,
@@ -150,6 +151,7 @@ export function createSky() {
       uniform vec3 uSunDir;
       uniform float uCamAlt, uTime, uCirrus, uSunDisc;
       uniform vec3 uGroundAlbedo;
+      uniform vec3 uPlanetOffset;
       uniform int uSteps;
       varying vec3 vDir;
       #include <common>
@@ -177,15 +179,30 @@ export function createSky() {
 
         vec2 tp = raySphere(ro, rd, PLANET_R);
         if (tp.x > 0.0) {
-          // Earth surface seen from altitude beyond the terrain mesh
+          // Earth seen from altitude (beyond the terrain mesh / from orbit):
+          // ocean with sun glint, sparse land, cloud fields, day/night terminator
           vec3 hp = ro + rd * tp.x;
           vec3 n = normalize(hp);
           vec3 ts = sunTransmittance(hp + n * 10.0, uSunDir);
-          float ndl = max(dot(n, uSunDir), 0.0);
-          vec2 uv = hp.xz * 0.00002;
-          float land = smoothstep(0.45, 0.6, fbm2(uv, 4));
-          vec3 alb = mix(vec3(0.02, 0.05, 0.08), vec3(0.11, 0.1, 0.07), land);
-          col += T * alb * ts * SUN_I * ndl / 3.14159;
+          float ndl = dot(n, uSunDir);
+          vec3 q = n * 1400.0 + uPlanetOffset;
+          float land = smoothstep(0.62, 0.7, fbm3(q * 0.9, 5));
+          vec3 alb = mix(vec3(0.012, 0.03, 0.055), mix(vec3(0.09, 0.085, 0.06), vec3(0.05, 0.07, 0.035), fbm3(q * 7.0, 3)), land);
+          // clouds: large weather systems + cumulus fields
+          float cw = fbm3(q * 0.55 + vec3(uTime * 0.0004), 5);
+          float cf = fbm3(q * 4.5 + 7.0, 5);
+          float cloud = smoothstep(0.48, 0.66, cw * 0.65 + cf * 0.5 - 0.08) * (0.55 + 0.45 * smoothstep(0.35, 0.7, cf));
+          vec3 cAlb = vec3(0.78) * (0.75 + 0.25 * cf);
+          vec3 surf = mix(alb, cAlb, cloud);
+          vec3 lit = surf * ts * SUN_I * max(ndl, 0.0) / 3.14159;
+          // specular sun glint on open water
+          vec3 rv = reflect(rd, n);
+          float gl = pow(max(dot(rv, uSunDir), 0.0), 900.0) * (1.0 - land) * (1.0 - cloud);
+          float fres = 0.02 + 0.98 * pow(1.0 - max(dot(-rd, n), 0.0), 5.0);
+          lit += ts * SUN_I * gl * fres * 40.0 * step(0.0, ndl);
+          // faint airglow/city lights on the night side
+          lit += vec3(0.9, 0.7, 0.4) * 0.002 * land * step(0.8, fbm3(q * 30.0, 2)) * smoothstep(0.02, -0.1, ndl);
+          col += T * lit;
         } else {
           // sun disc with limb darkening
           float mu = dot(rd, uSunDir);
