@@ -109,7 +109,7 @@ function jetMaterial(reflection) {
   });
 }
 
-function volumeMaterial(reflection) {
+function volumeMaterial(reflection, plasma = false) {
   return new THREE.ShaderMaterial({
     uniforms: {
       ...shared,
@@ -121,7 +121,7 @@ function volumeMaterial(reflection) {
       uColHot: { value: new THREE.Vector3(1.0, 0.62, 0.5) },
       uColAlt: { value: new THREE.Vector3(0.95, 0.42, 0.72) },
     },
-    defines: reflection ? { REFLECTION: 1 } : {},
+    defines: { ...(reflection ? { REFLECTION: 1 } : {}), ...(plasma ? { PLASMA: 1 } : {}) },
     transparent: true,
     depthWrite: false,
     depthTest: reflection,
@@ -210,10 +210,18 @@ function volumeMaterial(reflection) {
           float T = mix(900.0, Tax, exp(-rn * rn * 1.4));
           // afterburning of fuel-rich exhaust with entrained air in the shear layer (dense air only)
           float shear = exp(-pow((rn - 0.85) / 0.35, 2.0)) * uPr * smoothstep(3.0, 18.0, s) * exp(-s / (uL * 0.6));
-          vec3 c = exhaustEmission(T, shear * 0.9 * (0.4 + nz));
+          #ifdef PLASMA
+            // re-entry wake: hot pink/orange near the ship, violet as it streams away
+            vec3 c = mix(mix(vec3(1.0, 0.5, 0.25), vec3(1.0, 0.32, 0.62), smoothstep(0.0, 0.25, sn)), vec3(0.55, 0.3, 1.0), smoothstep(0.3, 1.2, sn)) * 0.9;
+          #else
+            vec3 c = exhaustEmission(T, shear * 0.9 * (0.4 + nz));
+          #endif
           // thin, turbulent streaks let the background show through (semi-transparent look)
           float streak = 0.55 + 0.9 * fbm3(vec3(q.x * 0.35, s * 0.018 - uTime * 11.0, q.z * 0.35), 2);
           float e = (core + shear * 0.6) * fall * spread * dia * turb * streak * smoothstep(0.0, 6.0, s + 2.0);
+          #ifdef PLASMA
+            e *= smoothstep(0.0, 35.0, s);
+          #endif
           acc += c * e;
         }
         acc *= dt * uLevel * uGain * 7.0;
@@ -250,8 +258,9 @@ export class Plume {
     layout.forEach((e, i) => this.jets.setMatrixAt(i, new THREE.Matrix4().makeTranslation(e[0], e[4] ?? 0, e[1])));
     this.jets.frustumCulled = false;
     this.jets.renderOrder = 20;
-    this.volMain = volumeMaterial(false);
-    this.volRefl = volumeMaterial(true);
+    this.plasma = !!opts.plasma;
+    this.volMain = volumeMaterial(false, this.plasma);
+    this.volRefl = volumeMaterial(true, this.plasma);
     this.volume = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 1, 32, 1, false), this.volMain);
     this.volume.frustumCulled = false;
     this.volume.renderOrder = 21;
@@ -281,8 +290,9 @@ export class Plume {
     const avg = sum / this.level.length;
     const pr = Math.min(1, Math.max(0, pa / P0));
     const ex = 1 - Math.pow(pr, 0.35);
-    const L = (90 + 250 * ex + 900 * ex * ex) * (0.6 + 0.4 * Math.sqrt(avg));
-    const tanT = 0.035 + 0.62 * ex * ex;
+    let L = (90 + 250 * ex + 900 * ex * ex) * (0.6 + 0.4 * Math.sqrt(avg));
+    let tanT = 0.035 + 0.62 * ex * ex;
+    if (this.plasma) { L = this.fixedL ?? 320; tanT = this.fixedTan ?? 0.1; }
     const Lb = L * 2;
     const Rb = (this.clusterR + Lb * tanT * 2.4) * 1.1 + 3;
     this.group.matrix.copy(stageMatrix).multiply(new THREE.Matrix4().makeTranslation(0, this.exitY, 0));

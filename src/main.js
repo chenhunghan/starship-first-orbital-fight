@@ -115,12 +115,14 @@ function refreshLighting(alt) {
   const lum = (v) => 0.2126 * v.x + 0.7152 * v.y + 0.0722 * v.z;
   // partial automatic white balance, like a camera: neutralise the scene illuminant by ~55%
   const ill = lighting.sun.clone().multiplyScalar(Math.max(0.05, sunDir.y) * 0.5).add(lighting.sky.clone().multiplyScalar(3.0));
+  ill.addScalar(1e-4); // night side: no illuminant, keep the balance neutral (and finite)
   const il = (ill.x + ill.y + ill.z) / 3;
   const wb = new THREE.Vector3(il / ill.x, il / ill.y, il / ill.z);
+  if (il < 0.01) wb.set(1, 1, 1);
   wb.set(Math.pow(wb.x, 0.55), Math.pow(wb.y, 0.55), Math.pow(wb.z, 0.55));
   const wl = 0.2126 * wb.x + 0.7152 * wb.y + 0.0722 * wb.z;
   pipeline.params.wb = wb.multiplyScalar(1 / wl);
-  baseExposure = 1.15 / Math.max(0.02, lum(lighting.sky) * 1.4 + lum(lighting.sun) * Math.max(0.05, sunDir.y) * 0.25);
+  baseExposure = Math.min(3, 1.15 / Math.max(0.02, lum(lighting.sky) * 1.4 + lum(lighting.sun) * Math.max(0.05, sunDir.y) * 0.25));
 }
 let baseExposure = 1, userEV = 0;
 
@@ -200,7 +202,7 @@ const yawEntry = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1,
 const _yawTmp = new THREE.Quaternion();
 const pose = {
   boosterPos: new THREE.Vector3(), boosterQuat: new THREE.Quaternion(), boosterVel: new THREE.Vector3(),
-  shipPos: new THREE.Vector3(), shipQuat: new THREE.Quaternion(), shipVel: new THREE.Vector3(),
+  shipPos: new THREE.Vector3(), shipQuat: new THREE.Quaternion(), shipVel: new THREE.Vector3(), shipAxis: new THREE.Vector3(0, 1, 0),
 };
 const prevB = new THREE.Vector3(), prevS = new THREE.Vector3();
 let splashT = null;
@@ -267,12 +269,20 @@ function updatePoses(dt) {
     if (pose.boosterVel.length() > 20000) pose.boosterVel.set(0, 0, 0);
     if (pose.shipVel.length() > 20000) pose.shipVel.set(0, 0, 0);
   }
+  // ship: after a tail-first splashdown it topples onto the water
+  if (sim.shipLanded) {
+    const k = Math.min(1, Math.max(0, (sim.t - sim.shipLanded.t) / 3.4));
+    const tip = new THREE.Quaternion().setFromAxisAngle(tiltAxis, k * k * 1.5);
+    pose.shipQuat.premultiply(tip);
+    pose.shipPos.y = -k * 4;
+  }
+  pose.shipAxis.set(0, 1, 0).applyQuaternion(pose.shipQuat);
   booster.group.position.copy(pose.boosterPos);
   booster.group.quaternion.copy(pose.boosterQuat);
   ship.group.position.copy(pose.shipPos);
   ship.group.quaternion.copy(pose.shipQuat);
   booster.group.visible = !(splashT !== null && sim.t - splashT > 30) && (anchorAngle === 0 || Math.abs(wrapPi(B.telemetry.downrange / RE - anchorAngle)) * RE < 400000);
-  ship.group.visible = !(sim.shipLanded && sim.t - sim.shipLanded.t > 25);
+  ship.group.visible = !(sim.shipLanded && sim.t - sim.shipLanded.t > 4.2);
 }
 
 function focusPoint() {
@@ -314,7 +324,7 @@ function advance(simDt) {
     effects.update(d, {
       sim, quality: Q.emit, stacked: sim.stacked,
       boosterPos: pose.boosterPos, boosterQuat: pose.boosterQuat, boosterVel: pose.boosterVel,
-      shipPos: pose.shipPos, shipQuat: pose.shipQuat, shipVel: pose.shipVel,
+      shipPos: pose.shipPos, shipQuat: pose.shipQuat, shipVel: pose.shipVel, shipAxis: pose.shipAxis,
       boosterPlume, shipPlume, shipThrust: sim.ship.engines.reduce((a, e) => a + e.level, 0) / 6,
     });
     ps.update(d);
@@ -521,7 +531,7 @@ function tick(now) {
   ship.group.updateMatrixWorld(true);
   boosterPlume.update(booster.group.matrixWorld, bLev, sim.booster.telemetry.pa, camera, Q.emit);
   shipPlume.update(ship.group.matrixWorld, sLev, sim.ship.telemetry.pa, camera, Q.emit);
-  plasma.update(ship.group, pose.shipVel, sim.ship.heat || 0);
+  plasma.update(ship.group, pose.shipVel, sim.ship.heat || 0, camera);
   ship.materials.tiles.userData.uniforms && (ship.materials.tiles.userData.uniforms.uHeat.value = Math.min(1, (sim.ship.heat || 0) * 1.1));
   booster.materials.ringMat.userData.shader && (booster.materials.ringMat.userData.shader.uniforms.uVentGlow.value =
     sim.flags['Hot staging'] && sim.t - (sim.stageTime ?? 0) < 4 ? Math.max(0, 1 - (sim.t - sim.stageTime) / 4) : 0);
@@ -544,7 +554,13 @@ function tick(now) {
   const nozzle = new THREE.Vector3(0, -2, 0).applyQuaternion(pose.boosterQuat).add(pose.boosterPos);
   const fire = new THREE.Vector3(nozzle.x, Math.max(4, Math.min(nozzle.y - 25, nozzle.y * 0.5)), nozzle.z);
   const flicker = 0.85 + 0.15 * Math.sin(now * 0.05) * Math.sin(now * 0.031);
-  const fI = thrust * flicker * (bh < 3000 ? 1 : 0.3);
+  let fI = thrust * flicker * (bh < 3000 ? 1 : 0.3) * (anchorAngle === 0 ? 1 : 0);
+  // splashdown fireball lights the water & smoke
+  if (sim.shipLanded && anchorAngle !== 0) {
+    const tb = sim.t - sim.shipLanded.t - 3.4;
+    const b = tb > 0 ? Math.exp(-tb / 2.2) * 1.4 : 0;
+    if (b > 0.01) { fire.copy(pose.shipPos).setY(10); fI = Math.max(fI, b); }
+  }
   flameLight.position.copy(fire);
   flameLight.intensity = 9.0e4 * fI;
   flameLight.color.setRGB(1, 0.58, 0.3);

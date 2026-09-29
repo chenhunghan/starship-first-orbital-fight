@@ -230,7 +230,7 @@ export function createSky() {
         float lum = dot(col, vec3(0.3, 0.6, 0.1));
         vec3 sp = rd * 700.0;
         float st = step(0.9975, hash13(floor(sp))) * hash13(floor(sp) + 3.0);
-        col += vec3(st) * 0.06 * smoothstep(0.02, 0.0, lum);
+        col += vec3(st) * 0.012 * smoothstep(0.02, 0.0, lum);
         gl_FragColor = vec4(min(col, vec3(20000.0)), 1.0);
         #include <logdepthbuf_fragment>
       }`,

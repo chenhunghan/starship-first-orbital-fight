@@ -189,6 +189,46 @@ export class Effects {
         });
       }
     }
+    // ------------------------------------------------ ship landing burn, tip-over and fireball
+    const S = sim.ship;
+    if ((S.phase === 'landing' || S.phase === 'flip') && S.active) {
+      const h = S.telemetry.h;
+      const lev = S.engines.reduce((a, e) => a + (e.ring === 0 ? e.level : 0), 0) / 3;
+      n = this.rate('shipSplash', 220 * Math.min(1, Math.exp(-h / 50) * lev * 3), dt);
+      for (let i = 0; i < n; i++) {
+        const ang = r() * Math.PI * 2, sp = 25 + r() * 55;
+        ps.emit(s.shipPos.x + Math.cos(ang) * 4, 2, s.shipPos.z + Math.sin(ang) * 4, Math.cos(ang) * sp, 3 + r() * 12, Math.sin(ang) * sp, {
+          life: 18 + r() * 20, r0: 3, r1: 12 + r() * 10, growT: 4, hot: 450, warm: 30, dens: 0.7, kind: KIND.SMOKE,
+        });
+      }
+    }
+    if (sim.shipLanded) {
+      const ts = t - sim.shipLanded.t;
+      // the ship topples and its residual propellant ignites (Flight 14: large fireball)
+      if (ts > 3.4 && !this.boom) {
+        this.boom = true;
+        for (let i = 0; i < 700; i++) {
+          const a = r() * Math.PI * 2, e = r() * 1.2, sp = 18 + r() * 70;
+          const along = (r() - 0.5) * 50;
+          const fire = r() < 0.65;
+          ps.emit(s.shipPos.x + s.shipAxis.x * along, 3 + r() * 6, s.shipPos.z + s.shipAxis.z * along,
+            Math.cos(a) * Math.cos(e) * sp, Math.sin(e) * sp + 8, Math.sin(a) * Math.cos(e) * sp, {
+              life: fire ? 4 + r() * 5 : 30 + r() * 30, r0: 4, r1: fire ? 22 + r() * 18 : 30 + r() * 25, growT: fire ? 1.2 : 6,
+              hot: fire ? 2100 + r() * 300 : 600, heatT: fire ? 1.3 : 0.6, warm: 160, dens: fire ? 0.8 : 0.6, tint: fire ? 0.2 : 0.75,
+              kind: KIND.SMOKE, spin: 0.5,
+            });
+        }
+      }
+      if (ts > 3.4 && ts < 14) {
+        n = this.rate('boomSmoke', 80, dt);
+        for (let i = 0; i < n; i++) {
+          const a = r() * Math.PI * 2;
+          ps.emit(s.shipPos.x + (r() - 0.5) * 30, 4, s.shipPos.z + (r() - 0.5) * 30, Math.cos(a) * 6, 8 + r() * 10, Math.sin(a) * 6, {
+            life: 40 + r() * 30, r0: 8, r1: 35, growT: 8, hot: 900, heatT: 1, warm: 120, dens: 0.55, tint: 0.85, kind: KIND.SMOKE,
+          });
+        }
+      }
+    } else this.boom = false;
     void _b;
   }
 }
