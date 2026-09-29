@@ -13,6 +13,7 @@ import { LaunchAudio } from './audio.js';
 import { shared } from './shared.js';
 import { createUI } from './ui.js';
 import { createClouds } from './clouds.js';
+import { SmokeVolume, insideVolume } from './smoke.js';
 import { sunTransmittanceJS } from './sky.js';
 
 // ------------------------------------------------------------------ setup
@@ -31,10 +32,10 @@ const pscene = new THREE.Scene(); // particles & plumes (rendered into the trans
 const pipeline = new Pipeline(renderer);
 
 const QUALITY = {
-  low: { cloudScale: 0.33, clouds: 64, scale: 0.55, part: 0.4, refl: 0.25, shadow: 2048, msaa: 0, emit: 0.55, sky: 10, lighting: 0.2, maxParticles: 9000 },
-  medium: { cloudScale: 0.4, clouds: 90, scale: 0.75, part: 0.5, refl: 0.33, shadow: 2048, msaa: 2, emit: 0.75, sky: 12, lighting: 0.25, maxParticles: 12000 },
-  high: { cloudScale: 0.5, clouds: 128, scale: 1.0, part: 0.6, refl: 0.5, shadow: 4096, msaa: 4, emit: 1.0, sky: 16, lighting: 0.34, maxParticles: 16000 },
-  ultra: { cloudScale: 0.6, clouds: 160, scale: Math.min(window.devicePixelRatio || 1, 2), part: 0.75, refl: 0.6, shadow: 4096, msaa: 4, emit: 1.0, sky: 20, lighting: 0.5, maxParticles: 16000 },
+  low: { smokeSteps: 48, smokeScale: 0.4, cloudScale: 0.33, clouds: 64, scale: 0.55, part: 0.4, refl: 0.25, shadow: 2048, msaa: 0, emit: 0.55, sky: 10, lighting: 0.2, maxParticles: 9000 },
+  medium: { smokeSteps: 72, smokeScale: 0.5, cloudScale: 0.4, clouds: 90, scale: 0.75, part: 0.5, refl: 0.33, shadow: 2048, msaa: 2, emit: 0.75, sky: 12, lighting: 0.25, maxParticles: 12000 },
+  high: { smokeSteps: 100, smokeScale: 0.6, cloudScale: 0.5, clouds: 128, scale: 1.0, part: 0.6, refl: 0.5, shadow: 4096, msaa: 4, emit: 1.0, sky: 16, lighting: 0.34, maxParticles: 16000 },
+  ultra: { smokeSteps: 150, smokeScale: 0.75, cloudScale: 0.6, clouds: 160, scale: Math.min(window.devicePixelRatio || 1, 2), part: 0.75, refl: 0.6, shadow: 4096, msaa: 4, emit: 1.0, sky: 20, lighting: 0.5, maxParticles: 16000 },
 };
 const params = new URLSearchParams(location.search);
 let qualityName = params.get('q') || (/(iPhone|iPad|Android)/i.test(navigator.userAgent) ? 'low' : 'high');
@@ -70,6 +71,9 @@ const ps = new ParticleSystem(QUALITY.high.maxParticles + 4000);
 pscene.add(ps.farMesh, ps.nearMesh);
 const clouds = createClouds();
 pscene.add(clouds.mesh);
+const smoke = new SmokeVolume(renderer, clouds.noise);
+pscene.add(smoke.compBack, smoke.compFront);
+ps.volumeTest = (x, y, z) => insideVolume(x, y, z, 20);
 const effects = new Effects(ps);
 const audio = new LaunchAudio();
 const sim = new FlightSim();
@@ -304,6 +308,7 @@ function setQuality(name) {
   pipeline.params.msaa = Q.msaa;
   sky.uniforms.uSteps.value = Q.sky;
   clouds.uniforms.uSteps.value = Q.clouds;
+  smoke.uniforms.uSteps.value = Q.smokeSteps;
   if (sun.shadow.map && sun.shadow.mapSize.x !== Q.shadow) { sun.shadow.map.dispose(); sun.shadow.map = null; }
   sun.shadow.mapSize.set(Q.shadow, Q.shadow);
   resize();
@@ -322,6 +327,7 @@ function resize() {
   pipeline.setSize(Math.floor(w * Q.scale), Math.floor(h * Q.scale));
   shared.uResolution.value.set(pipeline.w, pipeline.h);
   clouds.setSize(pipeline.w * Q.cloudScale, pipeline.h * Q.cloudScale);
+  smoke.setSize(pipeline.w * Q.smokeScale, pipeline.h * Q.smokeScale);
 }
 window.addEventListener('resize', resize);
 
@@ -350,6 +356,8 @@ function renderReflection() {
   renderer.setRenderTarget(pipeline.refl);
   renderer.render(scene, mirror);
   clouds.renderReflection(renderer, mirror);
+  smoke.compBack.visible = smoke.compFront.visible = false;
+  smoke.renderReflection(mirror);
   ps.setReflectionMode(true); boosterPlume.setReflectionMode(true); shipPlume.setReflectionMode(true);
   clouds.mesh.visible = false;
   renderer.autoClear = false;
@@ -357,6 +365,7 @@ function renderReflection() {
   renderer.autoClear = true;
   ps.setReflectionMode(false); boosterPlume.setReflectionMode(false); shipPlume.setReflectionMode(false);
   clouds.mesh.visible = true;
+  smoke.compBack.visible = smoke.compFront.visible = true;
   renderer.shadowMap.autoUpdate = ss;
   terrain.visible = true;
   shared.uReflection.value = pipeline.refl.texture;
@@ -378,6 +387,7 @@ function render(time) {
   ps.uniforms.uLogFar.value = Math.log2(FAR + 1);
   boosterPlume.setDepth(pipeline.main.depthTexture, res, Math.log2(FAR + 1));
   clouds.render(renderer, camera, pipeline.main.depthTexture);
+  smoke.render(camera, pipeline.main.depthTexture, boosterPlume.axis, ps.time);
   shipPlume.setDepth(pipeline.main.depthTexture, res, Math.log2(FAR + 1));
   renderer.setRenderTarget(pipeline.part);
   renderer.setClearColor(0x000000, 0);
@@ -433,6 +443,8 @@ function tick(now) {
     const onPad = !sim.released;
     const k = onPad ? 0.5 : Math.min(1, 0.6 + v / 60) * Math.exp(-hh / 5000) * (sim.stacked ? 1 : 0);
     booster.vapor.uVapor.value = k;
+    const M = sim.booster.telemetry.mach;
+    booster.collar.uCollar.value = sim.stacked ? Math.exp(-Math.pow((M - 1.0) / 0.13, 2)) * (hh < 15000 ? 1 : 0) : 0;
     booster.vapor.uFlow.value += dtReal * scale * (onPad ? 0.25 : 0.25 + v * 0.02);
   }
   const frost = booster.materials.steel.userData.shader;
@@ -504,6 +516,8 @@ function tick(now) {
   ps.rebuildGrid();
   ps.updateLighting(Q.lighting);
   ps.upload(camera, [boosterPlume.axis, shipPlume.axis]);
+  smoke.gather(ps);
+  smoke.build();
 
   shared.uTime.value = now * 0.001;
   shared.uCloudTime.value = now * 0.001;

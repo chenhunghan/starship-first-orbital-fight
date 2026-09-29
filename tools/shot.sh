@@ -1,7 +1,7 @@
 #!/bin/bash
 # usage: tools/shot.sh <name> <query> [targetT]
-export AGENT_BROWSER_SESSION=starship
-OUT=/private/tmp/claude-502/-Users-chh-starship/c0331c4d-204b-49ec-a507-9131af449337/scratchpad
+export AGENT_BROWSER_SESSION=${AGENT_BROWSER_SESSION:-starship}
+OUT=${SHOT_OUT:-/private/tmp/claude-502/-Users-chh-starship/c0331c4d-204b-49ec-a507-9131af449337/scratchpad}
 if [ -z "$KEEP" ]; then
   agent-browser close >/dev/null 2>&1
   agent-browser --args "--use-angle=metal,--enable-gpu,--ignore-gpu-blocklist" open about:blank >/dev/null 2>&1

@@ -359,9 +359,46 @@ export function createBooster() {
   vapor.castShadow = false;
   g.add(vapor);
 
+  // transonic condensation collars (Prandtl–Glauert vapour cones) behind the
+  // hot-staging ring and the ship's flaps, driven by the Mach number
+  const collarU = { uCollar: { value: 0 }, uFlow: vaporU.uFlow };
+  const collarMat = new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false, side: THREE.DoubleSide });
+  patchMaterial(collarMat, {
+    key: 'collar',
+    vertexHead: 'varying vec3 vWN;',
+    vertexEnd: 'vWN = normalize(mat3(modelMatrix) * normal);',
+    fragHead: 'uniform float uCollar, uFlow; uniform vec3 uSunColor, uSkyAmb; varying vec3 vWN;',
+    fragMap: /* glsl */ `
+      {
+        float a = atan(vObj.z, vObj.x);
+        float v = uv.y;
+        float n = fbm3(vec3(cos(a) * 4.0, sin(a) * 4.0, vObj.y * 0.35 + uFlow * 0.5), 4);
+        float m = smoothstep(0.35, 0.7, n) * smoothstep(0.0, 0.25, v) * smoothstep(1.0, 0.45, v) * uCollar;
+        vec3 V = normalize(cameraPosition - vWorld);
+        m *= 0.35 + 0.65 * (1.0 - abs(dot(normalize(vWN), V)));
+        float wrap = clamp(dot(normalize(vWN), uSunDir) * 0.5 + 0.6, 0.0, 1.0);
+        diffuseColor.rgb = vec3(0.95) * (uSunColor * wrap * 0.3 + uSkyAmb * 1.3);
+        diffuseColor.a = clamp(m, 0.0, 0.8);
+      }`,
+  }, collarU);
+  // uv is needed in the fragment shader
+  collarMat.onBeforeCompile = ((orig) => (sh) => {
+    orig(sh);
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nvarying vec2 vCUv;').replace('#include <begin_vertex>', '#include <begin_vertex>\nvCUv = uv;');
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying vec2 vCUv;').replace('float v = uv.y;', 'float v = vCUv.y;');
+  })(collarMat.onBeforeCompile);
+  for (const [y0, len, r0, r1] of [[70.5, 16, 4.9, 9.5], [110.5, 12, 4.6, 8.5]]) {
+    const cg = new THREE.CylinderGeometry(r0, r1, len, 48, 4, true);
+    cg.translate(0, y0 - len / 2, 0);
+    const c = new THREE.Mesh(cg, collarMat);
+    c.renderOrder = 6;
+    g.add(c);
+  }
+
   return {
     group: g,
     vapor: vaporU,
+    collar: collarU,
     materials: { steel, ringMat },
     engines,
     layout,

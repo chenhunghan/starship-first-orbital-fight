@@ -41,18 +41,18 @@ export class Effects {
     for (let i = 0; i < n; i++) {
       const ang = r() * Math.PI * 2;
       const hot = r() < 0.55;
-      const up = r() < 0.3;
-      const sp = (45 + r() * 120) * Math.sqrt(thrust) * (0.35 + 0.65 * ground);
+      const up = r() < 0.42;
+      const sp = (60 + r() * 150) * Math.sqrt(thrust) * (0.35 + 0.65 * ground);
       const rad = 5 + r() * 9;
       const cx = s.boosterPos.x, cz = s.boosterPos.z;
       ps.emit(cx + Math.cos(ang) * rad, 2 + r() * 7, cz + Math.sin(ang) * rad,
-        Math.cos(ang) * sp * (up ? 0.45 : 1), up ? 18 + r() * 30 : 2 + r() * 12, Math.sin(ang) * sp * (up ? 0.45 : 1), {
+        Math.cos(ang) * sp * (up ? 0.4 : 1), up ? 25 + r() * 45 : 2 + r() * 12, Math.sin(ang) * sp * (up ? 0.4 : 1), {
           life: 55 + r() * 110,
           r0: 4 + r() * 4,
           r1: 20 + r() * 32 + (up ? 10 : 0),
           growT: 5 + r() * 7,
           hot: hot ? 1300 + r() * 500 : 350,
-          warm: 55 + r() * 60,
+          warm: 90 + r() * 90,
           dens: 0.8 + r() * 0.2,
           tint: r() < 0.2 ? r() * 0.2 : 0,
           spin: 0.25,
@@ -107,7 +107,7 @@ export class Effects {
       // transonic condensation collar (Prandtl–Glauert cloud)
       const M = B.telemetry.mach;
       const pg = Math.exp(-Math.pow((M - 1.0) / 0.12, 2)) * (B.telemetry.h < 14000 ? 1 : 0);
-      n = this.rate('pg', 900 * pg, dt);
+      n = 0; void pg;
       for (let i = 0; i < n; i++) {
         const ang = r() * Math.PI * 2;
         const hl = r() < 0.55 ? 71 + r() * 3 : 104 + r() * 6;

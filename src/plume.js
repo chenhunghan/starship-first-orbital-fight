@@ -11,6 +11,30 @@ import { SOFT_DEPTH } from './particles.js';
 // into a huge faint plume.
 
 const P0 = 101325;
+const EXHAUST = /* glsl */ `
+// ---- exhaust colour model -------------------------------------------------
+// Normalised blackbody colour (linear sRGB), fit of the Planckian locus.
+vec3 bbColor(float T) {
+  T = clamp(T, 800.0, 12000.0) / 100.0;
+  vec3 c;
+  c.r = T <= 66.0 ? 1.0 : clamp(1.292936 * pow(T - 60.0, -0.1332047), 0.0, 1.0);
+  c.g = T <= 66.0 ? clamp(0.3900816 * log(T) - 0.6318414, 0.0, 1.0) : clamp(1.1298909 * pow(T - 60.0, -0.0755148), 0.0, 1.0);
+  c.b = T >= 66.0 ? 1.0 : (T <= 19.0 ? 0.0 : clamp(0.5432068 * log(T - 10.0) - 1.1962541, 0.0, 1.0));
+  return pow(c, vec3(2.2));
+}
+// Radiance of methalox exhaust at temperature T (K):
+//  thermal continuum (blackbody, ~T^4) + CH*/C2 violet bands (hot reaction zone)
+//  + H2O/OH pink-magenta emission (the typical Raptor plume tint) + afterburning.
+vec3 exhaustEmission(float T, float afterburn) {
+  float k = T / 3000.0;
+  vec3 thermal = bbColor(T) * k * k * k * k;
+  float band = smoothstep(1500.0, 3200.0, T);
+  vec3 violet = vec3(0.52, 0.34, 1.0) * band * 0.55;
+  vec3 pink = vec3(1.0, 0.42, 0.68) * smoothstep(900.0, 2400.0, T) * 0.45;
+  vec3 orange = vec3(1.0, 0.45, 0.12) * afterburn;
+  return thermal + violet * k * k + pink * k * k + orange;
+}
+`;
 
 function jetMaterial(reflection) {
   return new THREE.ShaderMaterial({
@@ -60,6 +84,7 @@ function jetMaterial(reflection) {
       ${NOISE}
       ${AERIAL}
       ${SOFT_DEPTH}
+      ${EXHAUST}
       void main() {
         if (vLevel < 0.01) discard;
         #ifndef REFLECTION
@@ -73,8 +98,9 @@ function jetMaterial(reflection) {
         float core = pow(vFacing, 1.6);
         float axial = exp(-vS * 3.0) * smoothstep(0.0, 0.03, vS);
         float flick = 0.85 + 0.3 * vnoise3(vec3(vWorldP.xz * 0.5, uTime * 30.0 + vSeed * 10.0));
-        vec3 base = mix(vec3(1.0, 0.78, 0.68), vec3(0.8, 0.45, 1.0), smoothstep(0.05, 0.7, vS));
-        vec3 col = base * axial * core * 16.0 + vec3(1.0, 0.93, 0.98) * dia * core * 70.0;
+        // jet core cools from ~3300 K at the exit; shock diamonds re-heat the gas
+        float Tj = 1400.0 + 1900.0 * exp(-vS * 2.2) + 900.0 * dia;
+        vec3 col = exhaustEmission(Tj, 0.0) * axial * core * 4.0 + bbColor(3600.0) * dia * core * 22.0;
         col *= vLevel * flick * uGain * 0.55;
         col *= aerialT(vWorldP, cameraPosition);
         gl_FragColor = vec4(col, 0.0);
@@ -88,7 +114,7 @@ function volumeMaterial(reflection) {
     uniforms: {
       ...shared,
       uInv: { value: new THREE.Matrix4() },
-      uR0: { value: 4 }, uL: { value: 70 }, uTan: { value: 0.035 }, uRb: { value: 10 },
+      uR0: { value: 4 }, uL: { value: 70 }, uLb: { value: 140 }, uTan: { value: 0.035 }, uRb: { value: 10 },
       uPr: { value: 1 }, uLevel: { value: 0 }, uGain: { value: 1 }, uGroundY: { value: 0 }, uSteps: { value: 28 },
       uDepth: { value: null }, uLogFar: { value: Math.log2(2e6 + 1) }, uPartRes: { value: new THREE.Vector2(1, 1) },
       uCamFwd: { value: new THREE.Vector3() },
@@ -104,12 +130,12 @@ function volumeMaterial(reflection) {
     blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
     blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneFactor,
     vertexShader: /* glsl */ `
-      uniform float uRb, uL;
+      uniform float uRb, uL, uLb;
       varying vec3 vWorldP;
       #include <common>
       #include <logdepthbuf_pars_vertex>
       void main() {
-        vec3 p = vec3(position.x * uRb, position.y * uL - uL * 0.5 + 1.0, position.z * uRb);
+        vec3 p = vec3(position.x * uRb, position.y * uLb - uLb * 0.5 + 1.0, position.z * uRb);
         vec4 wp = modelMatrix * vec4(p, 1.0);
         vWorldP = wp.xyz;
         gl_Position = projectionMatrix * viewMatrix * wp;
@@ -117,7 +143,7 @@ function volumeMaterial(reflection) {
       }`,
     fragmentShader: /* glsl */ `
       uniform mat4 uInv;
-      uniform float uR0, uL, uTan, uRb, uPr, uLevel, uGain, uGroundY, uTime;
+      uniform float uR0, uL, uLb, uTan, uRb, uPr, uLevel, uGain, uGroundY, uTime;
       uniform int uSteps;
       uniform vec3 uCamFwd, uColHot, uColAlt;
       varying vec3 vWorldP;
@@ -126,6 +152,7 @@ function volumeMaterial(reflection) {
       ${NOISE}
       ${AERIAL}
       ${SOFT_DEPTH}
+      ${EXHAUST}
       vec2 cyl(vec3 ro, vec3 rd, float r) {
         float a = dot(rd.xz, rd.xz);
         float b = dot(ro.xz, rd.xz);
@@ -143,7 +170,7 @@ function volumeMaterial(reflection) {
         vec3 rd = normalize(mat3(uInv) * rdW);
         vec2 tc = cyl(ro, rd, uRb);
         // slab y in [-L, 1]
-        float ty0 = (1.0 - ro.y) / rd.y, ty1 = (-uL - ro.y) / rd.y;
+        float ty0 = (1.0 - ro.y) / rd.y, ty1 = (-uLb - ro.y) / rd.y;
         vec2 ty = vec2(min(ty0, ty1), max(ty0, ty1));
         float t0 = max(max(tc.x, ty.x), 0.0);
         float t1 = min(tc.y, ty.y);
@@ -165,21 +192,31 @@ function volumeMaterial(reflection) {
           if (s < 0.0) continue;
           vec3 qw = roW + rdW * t;
           if (qw.y < uGroundY) continue;
-          float Rs = uR0 + s * uTan;
+          float sn = s / uL;
+          float Rs = uR0 + s * uTan * (1.0 + 0.7 * sn);   // the plume keeps spreading downstream
           float rr = length(q.xz);
-          float core = exp(-rr * rr / (Rs * Rs * 0.45));
-          float fall = exp(-s / (uL * 0.32));
+          float core = exp(-rr * rr / (Rs * Rs * 0.45)) * (1.0 - smoothstep(uRb * 0.8, uRb, rr));
+          // gradual dissipation: no hard end, it thins out into the air
+          float fall = exp(-s / (uL * 0.32)) * (1.0 - smoothstep(0.7 * uLb * 0.5, uLb * 0.98, s));
           float spread = (uR0 * uR0) / (Rs * Rs);
           // merged shock structure near sea level
           float dia = 1.0 + 2.2 * uPr * exp(-pow((s - 26.0) / 5.5, 2.0)) * exp(-rr * rr / (Rs * Rs * 0.12));
           float nz = fbm3(vec3(q.x * 0.12, s * 0.07 - uTime * 7.0, q.z * 0.12), 3);
-          float turb = 0.5 + 1.0 * nz;
-          float hot = exp(-s / (uL * 0.12));
-          vec3 c = mix(mix(uColAlt, uColHot, uPr), vec3(1.0, 0.92, 0.85), hot * 0.8);
-          float e = core * fall * spread * dia * turb * smoothstep(0.0, 6.0, s + 2.0);
+          float nz2 = fbm3(vec3(q.x * 0.05, s * 0.03 - uTime * 3.0, q.z * 0.05), 3);
+          float turb = mix(0.75 + 0.5 * nz, max(0.0, 2.2 * nz2 - 0.55) * (0.6 + nz), smoothstep(0.1, 1.1, sn));
+          // temperature: hot potential core cooling downstream and toward the mixing layer
+          float rn = rr / Rs;
+          float Tax = 1100.0 + 2300.0 * exp(-s / (uL * 0.22)) + 500.0 * (dia - 1.0);
+          float T = mix(900.0, Tax, exp(-rn * rn * 1.4));
+          // afterburning of fuel-rich exhaust with entrained air in the shear layer (dense air only)
+          float shear = exp(-pow((rn - 0.85) / 0.35, 2.0)) * uPr * smoothstep(3.0, 18.0, s) * exp(-s / (uL * 0.6));
+          vec3 c = exhaustEmission(T, shear * 0.9 * (0.4 + nz));
+          // thin, turbulent streaks let the background show through (semi-transparent look)
+          float streak = 0.55 + 0.9 * fbm3(vec3(q.x * 0.35, s * 0.018 - uTime * 11.0, q.z * 0.35), 2);
+          float e = (core + shear * 0.6) * fall * spread * dia * turb * streak * smoothstep(0.0, 6.0, s + 2.0);
           acc += c * e;
         }
-        acc *= dt * uLevel * uGain * 3.6;
+        acc *= dt * uLevel * uGain * 7.0;
         acc *= aerialT(roW + rdW * (t0 + t1) * 0.5, roW);
         gl_FragColor = vec4(acc, 0.0);
         #include <logdepthbuf_fragment>
@@ -244,9 +281,10 @@ export class Plume {
     const avg = sum / this.level.length;
     const pr = Math.min(1, Math.max(0, pa / P0));
     const ex = 1 - Math.pow(pr, 0.35);
-    const L = (72 + 900 * ex * ex) * (0.6 + 0.4 * Math.sqrt(avg));
+    const L = (90 + 250 * ex + 900 * ex * ex) * (0.6 + 0.4 * Math.sqrt(avg));
     const tanT = 0.035 + 0.62 * ex * ex;
-    const Rb = (this.clusterR + L * tanT) * 1.25 + 2;
+    const Lb = L * 2;
+    const Rb = (this.clusterR + Lb * tanT * 2.4) * 1.1 + 3;
     this.group.matrix.copy(stageMatrix).multiply(new THREE.Matrix4().makeTranslation(0, this.exitY, 0));
     this.group.matrixWorld.copy(this.group.matrix);
     this.group.updateMatrixWorld(true);
@@ -258,6 +296,7 @@ export class Plume {
       u.uInv.value.copy(inv);
       u.uR0.value = this.clusterR;
       u.uL.value = L;
+      u.uLb.value = Lb;
       u.uTan.value = tanT;
       u.uRb.value = Rb;
       u.uPr.value = pr;

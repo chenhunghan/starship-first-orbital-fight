@@ -223,7 +223,7 @@ export function createClouds() {
   composite.renderOrder = 1;
   let rt = null;
   return {
-    mesh: composite, uniforms,
+    mesh: composite, uniforms, noise,
     setSize(w, h) {
       rt?.dispose();
       rt = new THREE.WebGLRenderTarget(Math.max(1, Math.floor(w)), Math.max(1, Math.floor(h)), { type: THREE.HalfFloatType, depthBuffer: false });

@@ -109,7 +109,7 @@ export class ParticleSystem {
       const tyv = (b1 * 0.55 + b2 * 0.4) * turbA * 0.8;
       const tzv = wz0 * ws + (c1 * 1.0 + c2 * 0.55) * turbA;
       // entrainment drag: fast early deceleration, then follow the air
-      const kd = this.drag[i] / (0.55 + age * 0.45);
+      const kd = this.drag[i] / (0.9 + age * 0.5);
       const kk = Math.min(1, kd * dt);
       v[i * 3] += (txv - v[i * 3]) * kk;
       v[i * 3 + 1] += (tyv - v[i * 3 + 1]) * kk + (buoy - this.grav[i] * 9.81) * dt;
@@ -357,6 +357,7 @@ export class ParticleSystem {
     for (let i = 0; i < this.count; i++) {
       const op = this.op[i];
       if (op < 0.004) continue;
+      if (this.volumeTest && this.kind[i] === KIND.SMOKE && this.volumeTest(this.p[i * 3], this.p[i * 3 + 1], this.p[i * 3 + 2])) continue;
       const dx = this.p[i * 3] - cam.x, dy = this.p[i * 3 + 1] - cam.y, dz = this.p[i * 3 + 2] - cam.z;
       const d = -(dx * bx + dy * by + dz * bz);
       const r = this.size[i];
