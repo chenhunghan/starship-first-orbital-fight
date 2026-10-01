@@ -19,6 +19,7 @@ import { SmokeVolume, insideVolume } from './smoke.js';
 import { sunTransmittanceJS } from './sky.js';
 import { prof } from './prof.js';
 import { QualityGovernor } from './governor.js';
+import { FluidField } from './fluidClient.js';
 
 // ------------------------------------------------------------------ setup
 const canvas = document.getElementById('c');
@@ -49,8 +50,8 @@ if (prof.enabled) {
   const sm = renderer.shadowMap, r0 = sm.render.bind(sm);
   sm.render = (...a) => { if ((!sm.needsUpdate && !sm.autoUpdate) || !a[0].length) return r0(...a); prof.begin('shadow'); r0(...a); prof.end(); };
 }
-let qualityName = params.get('q') || (/(iPhone|iPad|Android)/i.test(navigator.userAgent) ? 'low' : 'high');
-let Q = QUALITY[qualityName] || QUALITY.high;
+let qualityName = QUALITY[params.get('q')] ? params.get('q') : 'ultra';
+let Q = QUALITY[qualityName];
 // keeps >= 30 fps by trading internal resolution (never above the preset; ?nogov disables)
 const gov = new QualityGovernor({ targetFps: 30, enabled: !params.has('nogov') });
 
@@ -91,6 +92,9 @@ pscene.add(clouds.mesh);
 const smoke = new SmokeVolume(renderer, clouds.noise);
 pscene.add(smoke.compBack, smoke.compFront);
 ps.volumeTest = (x, y, z) => insideVolume(x, y, z, 20);
+// air flow around the pad (incompressible solver in a worker), two-way coupled to the smoke
+const fluid = new FluidField();
+ps.fluid = fluid;
 const effects = new Effects(ps);
 const audio = new LaunchAudio();
 const sim = new FlightSim();
@@ -285,6 +289,7 @@ function updateAnchor() {
     pad.visible = !far;
     terrain.userData.uniforms.uOpen.value = far ? 1 : 0;
     for (let i = ps.count - 1; i >= 0; i--) if (ps.kind[i] !== KIND.CLOUD) ps.kill(i);
+    fluid.reset();
     return true;
   }
   return false;
@@ -348,6 +353,7 @@ let simAcc = 0;
 function restart() {
   sim.reset();
   for (let i = ps.count - 1; i >= 0; i--) if (ps.kind[i] !== KIND.CLOUD) ps.kill(i);
+  fluid.reset();
   effects.acc = {}; effects.stagingBurst = false;
   splashT = null;
   eventsShown = 0;
@@ -385,6 +391,9 @@ function advance(simDt) {
     left -= d;
   }
   ps.driftClouds(simDt);
+  prof.cbegin('fluid');
+  fluid.update(simDt, ps, anchorAngle === 0 ? ps.jet : null);
+  prof.cend();
 }
 
 // automatic time-warp through the long quiet parts of the mission (coast, orbit, entry)
@@ -629,6 +638,9 @@ function tick(now) {
   ui.setWarp(autoWarp && scale > timeScale * 1.01 ? scale : 0);
   if (seeking !== null) {
     scale = Math.min(sim.t > 900 ? 900 : 60, Math.max(4, (seeking - sim.t) * 2));
+    // while the pad cloud forms, keep the fast-forward slow enough for the air-flow
+    // solver to keep pace with the particles (it steps once per frame)
+    if (sim.t > -2 && sim.t < 40) scale = Math.min(scale, 6);
     if (sim.t >= seeking) { seeking = null; if (params.has('pause')) { paused = true; ui.setPaused(true); } }
   }
   const simDt = dtReal * scale;
@@ -802,7 +814,7 @@ function boot() {
     const c = { id: 'custom', name: 'Custom', mode: 'free', pos: params.get('campos').split(',').map(Number), target: (params.get('camtgt') || '0,60,0').split(',').map(Number), fov: +(params.get('fov') || 40) };
     setCamera(c);
   }
-  window.__app = { scene, booster, ship, terrain, clouds, seekingDone: () => seeking === null && started, sim, ps, camera, controls, seek, setCamera, CAMS, renderer, pipeline, setSun, setQuality,
+  window.__app = { fluid, scene, booster, ship, terrain, clouds, seekingDone: () => seeking === null && started, sim, ps, camera, controls, seek, setCamera, CAMS, renderer, pipeline, setSun, setQuality,
     smoke, sky, sun, pscene, boosterPlume, shipPlume, plasma, DBG, Q: () => Q, governor: gov };
   window.__prof = prof;
 }

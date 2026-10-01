@@ -9,7 +9,11 @@ export const GOV_LEVELS = [
   { scale: 0.9, steps: 1.0 },
   { scale: 0.8, steps: 1.0 },
   { scale: 0.72, steps: 0.85 },
-  { scale: 0.64, steps: 0.75 }, // floor
+  { scale: 0.64, steps: 0.75 },
+  // Ultra is the default on every device: these let a phone keep its effects at a lower
+  // internal resolution
+  { scale: 0.56, steps: 0.7 },
+  { scale: 0.48, steps: 0.62 }, // floor
 ];
 
 export class QualityGovernor {

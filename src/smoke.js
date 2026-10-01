@@ -350,7 +350,7 @@ export class SmokeVolume {
                 float odF = L.g * SIGMA;
                 float occ = L.b;
                 // sun: single scattering + two softer multiple-scattering octaves
-                float beer = exp(-odS) + 0.5 * exp(-odS * 0.25) + 0.25 * exp(-odS * 0.06);
+                float beer = exp(-odS) + 0.42 * exp(-odS * 0.25) + 0.12 * exp(-odS * 0.06);
                 float powder = 1.0 - exp(-dens * 2.0);
                 // small-scale self shadowing: compare the erosion field one step toward the sun
                 vec3 po = (p + uSunDir * 7.0 - adv) / 110.0;
@@ -365,7 +365,15 @@ export class SmokeVolume {
                 // engine fire lighting the steam from below/inside
                 vec3 tf = uFlamePos - p;
                 float df2 = dot(tf, tf);
-                vec3 fl = uFlameColor * (exp(-odF) + 0.3 * exp(-odF * 0.2)) / (df2 + 1600.0) * 1.4;
+                // the luminous plume is a line source: fall-off from the nearest point of its
+                // axis (the transmittance still comes from the light volume, toward uFlamePos)
+                float dl2 = df2;
+                if (uPlumeL > 0.0) {
+                  vec3 wq = p - uPlumeO;
+                  vec3 ql = wq - uPlumeD * clamp(dot(wq, uPlumeD), 0.0, uPlumeL);
+                  dl2 = min(df2, dot(ql, ql) + 400.0);
+                }
+                vec3 fl = uFlameColor * (exp(-odF) + 0.3 * exp(-odF * 0.2)) / (dl2 + 1600.0) * 1.4;
                 vec3 alb = mix(vec3(0.97, 0.97, 0.97), vec3(0.62, 0.54, 0.46), clamp(v.b / max(base, 1e-3), 0.0, 1.0));
                 vec3 S = alb * (sunL + amb + fl);
                 // incandescence of the hot exhaust core

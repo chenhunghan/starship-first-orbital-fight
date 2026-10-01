@@ -44,11 +44,14 @@ Almost all of these times come out of the physics and guidance rather than being
 ### Rendering
 - **Sky:** a single-scattering Rayleigh + Mie + ozone atmosphere with an approximation of multiple scattering. It works from sea level to space, where you see a black sky and the atmospheric limb. Cirrus and contrails are drawn in the sky pass.
 - **Clouds:** ray-marched volumetric cumulus built from a procedural 3D Perlin-Worley noise texture. They use Beer-powder lighting and a dual-lobe phase function, cast shadows on the ground, and are occluded by scene depth.
-- **Smoke and steam:** about 16k CPU-simulated particles.
-  - Exhaust jets decelerate by entraining ambient air.
-  - Buoyancy comes from a two-component temperature model (hot core plus warm steam).
-  - Divergence-free turbulence, ground spreading and wind shape the clouds.
-  - Particles are lit through a density grid, which gives self-shadowing and the orange under-lighting from the engine fire.
+- **Smoke and steam:** about 16k CPU-simulated particles, moved by an incompressible air-flow solver around the pad (`src/fluid.js`).
+  - The solver is "stable fluids" on a 64 × 32 × 64 staggered (MAC) grid with 25 m cells. Each step does semi-Lagrangian advection, vorticity confinement and a red-black SOR pressure projection, with a solid ground and open sides and top. It runs only inside an active box that grows with the cloud, in a Web Worker, and is integrated with larger steps when the main thread is busy or the time is warped.
+  - The particles and the air are two-way coupled. Every particle carries a share of the ~22 t/s exhaust mass flow. In each cell, the air and the particles relax toward their common momentum-weighted velocity. This turns the exhaust leaving the deluge plate into a radial wall jet that rolls up at its front, pushes the surrounding air and draws in a return flow. The particles in turn follow the resolved air velocity, plus sub-grid eddies.
+  - The exhaust leaves through the six gaps between the mount legs, with turbulent bursts that come and go over a few seconds. The bursts grow into separate towers.
+  - Buoyancy: hot steam is light (it is hot, and water vapour is 18 g/mol against 29 g/mol for air). Its buoyancy is diluted with height by entrainment (Morton–Taylor–Turner plume theory), which caps the towers. Droplet-laden deluge mist is denser than air and spreads along the ground as a gravity current.
+  - The wind profile is a sea-breeze boundary layer that veers into the westerlies aloft. It has a jet near 11 km and shear layers that twist the ascent trail.
+  - Ascent trail: a faint condensation column in the humid marine layer. Above ~8 km, where the air is colder than −40 °C (the Schmidt–Appleman criterion), it becomes a dense, persistent ice contrail. The trail spreads by turbulent diffusion (r² = r₀² + 2Kt).
+  - Particles are lit through a density grid, which gives self-shadowing. The engine plume acts as a line light for the orange under-lighting.
   - Sprites are sorted back to front and split around the plume, with soft-particle depth fade.
 - **Engine plumes:** each engine has its own near-field jet with Mach diamonds, plus a ray-marched merged plume. The plume grows with altitude as the exhaust becomes more underexpanded.
 - **Water:** planar reflections (sky, clouds, rocket, smoke) with Fresnel, GGX sun glint and waves.
@@ -61,7 +64,7 @@ Almost all of these times come out of the physics and guidance rather than being
   - Hexagonal heat-shield tiles on the windward side, flaps, grid fins, chines and the vented hot-staging ring.
   - Engine bells that glow while firing.
 - **Post-processing:** HDR, bloom, ACES tone mapping, camera-style white balance, grain and vignette.
-- **Performance:** an adaptive quality governor targets 30 fps by scaling render resolution (and ray-march steps at the lowest levels), never exceeding the chosen preset. The smoke volume is splatted in a single instanced draw into slice atlases, the cloud weather field and sun transmittance are baked, and a depth prepass feeds the volumetric passes.
+- **Performance:** the quality preset defaults to Ultra on every device. An adaptive quality governor targets 30 fps by scaling render resolution (and ray-march steps at the lower levels, down to 48 %), never exceeding the chosen preset. The smoke volume is splatted in a single instanced draw into slice atlases, the cloud weather field and sun transmittance are baked, and a depth prepass feeds the volumetric passes.
 - **Audio:** procedural rumble, roar and crackle. Sound arrives with the real propagation delay (343 m/s) and loses high frequencies over distance.
 
 ## Controls
@@ -77,7 +80,7 @@ Almost all of these times come out of the physics and guidance rather than being
 
 You can also set the sun position (morning or evening launch), exposure and render quality from the control panel.
 
-URL parameters: `?q=low|medium|high|ultra`, `?cam=telephoto`, `?t=120` (seek to that time), `?autostart`, `?pause` (pause after seeking), `?nogov` (disable the adaptive resolution governor), `?prof` / `?prof=sync` / `?prof=cpu` (per-pass timings via `window.__prof.report()`).
+URL parameters: `?q=low|medium|high|ultra` (default `ultra`), `?cam=telephoto`, `?t=120` (seek to that time), `?autostart`, `?pause` (pause after seeking), `?nogov` (disable the adaptive resolution governor), `?prof` / `?prof=sync` / `?prof=cpu` (per-pass timings via `window.__prof.report()`).
 
 ## Development
 
@@ -86,6 +89,7 @@ npm install
 npm run dev      # http://localhost:5173
 npm run build    # static site in dist/
 npm run sim      # print the flight profile from the physics model
+node tools/fluidbench.js 40   # headless check of the pad air-flow solver (timing, divergence, spread)
 ```
 
 The site deploys to GitHub Pages through `.github/workflows/deploy.yml` on every push to `main`.

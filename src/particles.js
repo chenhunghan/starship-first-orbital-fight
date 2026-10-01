@@ -1,13 +1,18 @@
 import * as THREE from 'three';
 import { NOISE, AERIAL } from './glsl.js';
 import { shared, rng } from './shared.js';
+import { ambientWind } from './fluid.js';
 
 // Smoke / steam / cloud particles.
 //
 // Physics (CPU, per particle):
 //  - momentum: exhaust jets decelerate by entraining ambient air (v ~ v0 / (1 + t/tau))
-//  - buoyancy: a = g * dT / (Ta + dT), dT = hot core (fast mixing) + warm steam (slow)
-//  - turbulence: divergence-free ABC flow at two scales, advected with the wind
+//  - air: inside the pad domain the particles relax toward the velocity resolved by the
+//    fluid solver (fluid.js), which they drive in turn. Outside it, they follow the
+//    ambient wind profile plus a divergence-free ABC flow at two scales.
+//  - sub-grid eddies: a finer ABC flow on top of the resolved velocity
+//  - buoyancy: a = g * dT / (Ta + dT), dT = hot core (fast mixing) + warm steam (slow),
+//    diluted with height by entrainment; droplet-laden mist (dT < 0) sinks
 //  - ground: particles cannot sink below the surface and spread radially
 //  - growth: radius grows with entrainment, opacity dissipates over the lifetime
 // Lighting: a coarse density grid is rebuilt every few frames; per-particle optical
@@ -26,7 +31,7 @@ export class ParticleSystem {
     this.age = f(); this.life = f(); this.r0 = f(); this.r1 = f(); this.gt = f(); this.size = f();
     this.hot = f(); this.warm = f(); this.dens = f(); this.seed = f(); this.rot = f(); this.rotV = f();
     this.sunT = f(); this.ao = f(); this.flameT = f(); this.tint = f(); this.op = f(); this.erode = f(); this.er0 = f();
-    this.drag = f(); this.grav = f(); this.heatT = f();
+    this.drag = f(); this.grav = f(); this.heatT = f(); this.mass = f(); this.diff = f();
     this.kind = new Uint8Array(max);
     this.count = 0;
     this.rand = rng(99);
@@ -62,6 +67,8 @@ export class ParticleSystem {
     this.drag[i] = o.drag ?? 1;
     this.grav[i] = o.grav ?? 0;
     this.heatT[i] = o.heatT ?? 1.2;
+    this.mass[i] = o.mass ?? 0;
+    this.diff[i] = o.diff ?? 0;
     this.kind[i] = o.kind ?? KIND.SMOKE;
     return i;
   }
@@ -71,7 +78,7 @@ export class ParticleSystem {
     if (i === j) return;
     const c3 = (a) => { a[i * 3] = a[j * 3]; a[i * 3 + 1] = a[j * 3 + 1]; a[i * 3 + 2] = a[j * 3 + 2]; };
     c3(this.p); c3(this.v);
-    for (const a of [this.age, this.life, this.r0, this.r1, this.gt, this.size, this.hot, this.warm, this.dens, this.seed, this.rot, this.rotV, this.sunT, this.ao, this.flameT, this.tint, this.op, this.erode, this.er0, this.drag, this.grav, this.heatT, this.kind]) a[i] = a[j];
+    for (const a of [this.age, this.life, this.r0, this.r1, this.gt, this.size, this.hot, this.warm, this.dens, this.seed, this.rot, this.rotV, this.sunT, this.ao, this.flameT, this.tint, this.op, this.erode, this.er0, this.drag, this.grav, this.heatT, this.mass, this.diff, this.kind]) a[i] = a[j];
   }
 
   // ------------------------------------------------------------- simulate
@@ -81,6 +88,9 @@ export class ParticleSystem {
     const t = this.time;
     const { p, v } = this;
     const wx0 = this.wind.x, wz0 = this.wind.z;
+    const F = this.fluid && this.fluid.active ? this.fluid : null;
+    const fv = this._fv || (this._fv = [0, 0, 0, 0]);
+    const aw = this._aw || (this._aw = [0, 0, 0]);
     for (let i = 0; i < this.count; i++) {
       const k = this.kind[i];
       if (k === KIND.CLOUD) continue; // drifted once per frame (driftClouds)
@@ -88,24 +98,44 @@ export class ParticleSystem {
       const life = this.life[i];
       if (age >= life) { this.kill(i); i--; continue; }
       const x = p[i * 3], y = p[i * 3 + 1], z = p[i * 3 + 2];
-      // temperature excess (K)
-      const dT = this.hot[i] * Math.exp(-age / 0.7) + this.warm[i] * Math.exp(-age / 28);
-      const buoy = (9.81 * dT) / (288 + dT) * 0.55;
-      // wind profile (power law) and turbulence
-      const ws = Math.pow(Math.max(y, 2) / 10, 0.14);
-      const s1 = 0.011, s2 = 0.037;
+      // temperature excess (K). A rising plume entrains ambient air and dilutes its
+      // buoyancy with height (Morton-Taylor-Turner: g' ~ z^-5/3), which caps the towers
+      let dT = this.hot[i] * Math.exp(-age / 0.7) + this.warm[i] * Math.exp(-age / 28);
+      if (k === KIND.SMOKE && y > 200 && dT > 0) dT *= Math.pow(1 + (y - 200) / 300, -5 / 3);
       const ph = t * 0.05;
       const tx = x - wx0 * t * 0.8, tz = z - wz0 * t * 0.8;
-      const a1 = Math.sin(tz * s1 + ph) + Math.cos(y * s1 * 1.3 - ph);
-      const b1 = Math.sin(tx * s1 * 1.1 - ph * 0.7) + Math.cos(tz * s1 + ph * 1.3);
-      const c1 = Math.sin(y * s1 * 1.2 + ph * 0.9) + Math.cos(tx * s1 - ph);
-      const a2 = Math.sin(tz * s2 - ph * 2) + Math.cos(y * s2 + ph * 1.7);
-      const b2 = Math.sin(tx * s2 + ph * 1.5) + Math.cos(tz * s2 - ph);
-      const c2 = Math.sin(y * s2 - ph * 2.2) + Math.cos(tx * s2 + ph * 0.6);
       const turbA = (k === KIND.SMOKE ? 2.6 : 1.0) * (1 + Math.min(age, 20) * 0.08);
-      const txv = wx0 * ws + (a1 * 1.0 + a2 * 0.55) * turbA;
-      const tyv = (b1 * 0.55 + b2 * 0.4) * turbA * 0.8;
-      const tzv = wz0 * ws + (c1 * 1.0 + c2 * 0.55) * turbA;
+      let txv, tyv, tzv, buoy;
+      if (F && k !== KIND.TRAIL && F.sample(x, y, z, fv)) {
+        // resolved air flow + sub-grid eddies (smaller than the 25 m cells). The particles
+        // are the hot gas: buoyancy acts on them and the drag coupling lifts the air.
+        const s3 = 0.083, s4 = 0.19;
+        const a3 = Math.sin(tz * s3 + ph * 3) + Math.cos(y * s3 * 1.1 - ph * 2.3);
+        const b3 = Math.sin(tx * s3 * 1.2 - ph * 2.1) + Math.cos(tz * s3 + ph * 2.9);
+        const c3 = Math.sin(y * s3 * 1.3 + ph * 2.7) + Math.cos(tx * s3 - ph * 3.1);
+        const a4 = Math.sin(tz * s4 - ph * 6) + Math.cos(y * s4 + ph * 5.1);
+        const b4 = Math.sin(tx * s4 + ph * 4.5) + Math.cos(tz * s4 - ph * 3);
+        const c4 = Math.sin(y * s4 - ph * 6.6) + Math.cos(tx * s4 + ph * 1.8);
+        const sg = turbA * 0.75;
+        txv = fv[0] + (a3 + a4 * 0.5) * sg;
+        tyv = fv[1] + (b3 + b4 * 0.5) * sg * 0.7;
+        tzv = fv[2] + (c3 + c4 * 0.5) * sg;
+        buoy = (9.81 * dT) / (288 + dT) * 0.55;
+      } else {
+        buoy = (9.81 * dT) / (288 + dT) * 0.55;
+        // wind profile and turbulence
+        ambientWind(y, aw);
+        const s1 = 0.011, s2 = 0.037;
+        const a1 = Math.sin(tz * s1 + ph) + Math.cos(y * s1 * 1.3 - ph);
+        const b1 = Math.sin(tx * s1 * 1.1 - ph * 0.7) + Math.cos(tz * s1 + ph * 1.3);
+        const c1 = Math.sin(y * s1 * 1.2 + ph * 0.9) + Math.cos(tx * s1 - ph);
+        const a2 = Math.sin(tz * s2 - ph * 2) + Math.cos(y * s2 + ph * 1.7);
+        const b2 = Math.sin(tx * s2 + ph * 1.5) + Math.cos(tz * s2 - ph);
+        const c2 = Math.sin(y * s2 - ph * 2.2) + Math.cos(tx * s2 + ph * 0.6);
+        txv = aw[0] + (a1 * 1.0 + a2 * 0.55) * turbA;
+        tyv = (b1 * 0.55 + b2 * 0.4) * turbA * 0.8;
+        tzv = aw[2] + (c1 * 1.0 + c2 * 0.55) * turbA;
+      }
       // the exhaust column blows steam away from the plume axis (keeps the centre open)
       const J = this.jet;
       if (J && J.strength > 0.01 && y < J.yTop + 10) {
@@ -124,8 +154,13 @@ export class ParticleSystem {
       p[i * 3] += v[i * 3] * dt;
       p[i * 3 + 1] += v[i * 3 + 1] * dt;
       p[i * 3 + 2] += v[i * 3 + 2] * dt;
-      // growth
-      const r = this.r0[i] + (this.r1[i] - this.r0[i]) * (1 - Math.exp(-age / this.gt[i])) + age * 0.12 * (k === KIND.SMOKE ? 1 : 0.2);
+      // growth (trail puffs: turbulent diffusion, r ~ sqrt(r0^2 + 2 K t); the puff thins as it spreads)
+      let r, thin = 1;
+      if (k === KIND.TRAIL && this.diff[i] > 0) {
+        const r0 = this.r0[i] + (this.r1[i] - this.r0[i]) * (1 - Math.exp(-age / this.gt[i]));
+        r = Math.sqrt(r0 * r0 + 2 * this.diff[i] * age);
+        thin = Math.min(1, (r0 * 1.15) / r);
+      } else r = this.r0[i] + (this.r1[i] - this.r0[i]) * (1 - Math.exp(-age / this.gt[i])) + age * 0.12 * (k === KIND.SMOKE ? 1 : 0.2);
       this.size[i] = r;
       // ground: spread sideways instead of sinking
       const floor = k === KIND.SPRAY ? 0.3 : r * 0.38;
@@ -144,7 +179,7 @@ export class ParticleSystem {
       const fin = Math.min(1, age / (k === KIND.VAPOR ? 0.3 : 0.15));
       const u = age / life;
       const fout = u < 0.55 ? 1 : Math.max(0, 1 - (u - 0.55) / 0.45);
-      this.op[i] = this.dens[i] * fin * fout * fout;
+      this.op[i] = this.dens[i] * fin * fout * fout * thin;
       this.erode[i] = Math.min(0.9, this.er0[i] + u * u * 0.7);
       this.rot[i] += this.rotV[i] * dt;
       // emissive temperature (for fire) stored in warm-independent channel
